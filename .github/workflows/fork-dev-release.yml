@@ -1,0 +1,131 @@
+# This workflow exists only on this fork, to try a branch on Linux and Windows
+# without the signing, notarisation, Docker and Homebrew secrets the real
+# release pipeline needs. It builds the client and the tray UI with the same
+# flags .goreleaser.yaml and .goreleaser_ui.yaml use, and attaches the binaries
+# to a prerelease. It is not meant to be sent upstream.
+
+name: Dev release (fork only)
+
+on:
+  # Pushing a dev-* tag is what actually runs this: workflow_dispatch only
+  # offers itself once the file has reached the default branch, and this one is
+  # meant to run from a topic branch.
+  push:
+    tags:
+      - "dev-*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing dev-* tag to build and publish"
+        required: true
+        default: "dev-tray-menu"
+      notes:
+        description: "One line describing what is being tried"
+        required: false
+        default: "Development build of the macOS tray menu branch."
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: "Build Linux + Windows and publish"
+    # 24.04 for GTK 4.14: the UI's cgo header wants GtkFileDialog, which only
+    # exists from GTK 4.10, and 22.04 ships 4.6.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d # v3.0.0
+        with:
+          version: 11
+
+      # gtk4/webkit for the Linux UI, mingw for the Windows one: the same set
+      # the release workflow installs for those two targets.
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y -q libgtk-4-dev libwebkitgtk-6.0-dev libsoup-3.0-dev gcc-mingw-w64-x86-64
+
+      - name: Install wails3 CLI
+        # Version taken from go.mod so the binding generator matches the wails
+        # runtime the binary links against.
+        run: |
+          WAILS_VERSION=$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v3)
+          go install github.com/wailsapp/wails/v3/cmd/wails3@$WAILS_VERSION
+
+      # Bindings are gitignored, and vite refuses to build without them.
+      - name: Generate bindings and build the frontend
+        run: |
+          cd client/ui
+          wails3 generate bindings -clean=true -ts
+          cd frontend
+          pnpm install --frozen-lockfile
+          PRODUCTION=true pnpm build
+
+      - name: Name this build
+        id: build_name
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: echo "tag=${INPUT_TAG:-$GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.build_name.outputs.tag }}
+        run: |
+          set -eux
+          mkdir -p dist
+          LDFLAGS="-s -w -X github.com/netbirdio/netbird/version.version=${VERSION}"
+
+          # Client and daemon: no cgo on either target.
+          (cd client && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "$LDFLAGS" -o ../dist/netbird-linux-amd64 .)
+          (cd client && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -ldflags "$LDFLAGS" -o ../dist/netbird-windows-amd64.exe .)
+
+          # Tray UI: cgo both times — gtk4 natively, mingw for Windows, and the
+          # windowsgui subsystem so the .exe does not open a console.
+          (cd client/ui && CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+            go build -tags production -trimpath -ldflags "$LDFLAGS" \
+            -o ../../dist/netbird-ui-linux-amd64 .)
+          (cd client/ui && CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
+            go build -tags production -trimpath -ldflags "$LDFLAGS -H windowsgui" \
+            -o ../../dist/netbird-ui-windows-amd64.exe .)
+
+          (cd dist && sha256sum * > checksums.txt)
+          ls -lh dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.build_name.outputs.tag }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -eux
+          NOTES="${NOTES:-Development build.}"
+          BODY="$NOTES
+
+          Built from ${GITHUB_SHA}. Unsigned development build: macOS is not
+          included here, and Windows warns on first run."
+
+          # Re-running on the same tag replaces the assets instead of failing.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes "$BODY" --prerelease
+          else
+            gh release create "$TAG" --title "$TAG" --notes "$BODY" --prerelease dist/*
+          fi
