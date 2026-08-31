@@ -30,6 +30,15 @@ func (t *Tray) applyStatus(st services.Status) {
 	sessionExpiredEnter := strings.EqualFold(st.Status, services.StatusSessionExpired) &&
 		!strings.EqualFold(t.lastStatus, services.StatusSessionExpired)
 
+	// A Down that has landed clears the tray's own disconnecting sentinel even
+	// if the RPC has not returned yet: once the daemon says the tunnel is down,
+	// its word beats our guess.
+	stoppedDisconnecting := t.disconnecting && !connected &&
+		!strings.EqualFold(st.Status, services.StatusConnecting)
+	if stoppedDisconnecting {
+		t.disconnecting = false
+	}
+
 	triggerLogin := t.consumePendingConnectLogin(st.Status)
 
 	daemonVersionChanged := st.DaemonVersion != "" && st.DaemonVersion != t.lastDaemonVersion
@@ -50,14 +59,25 @@ func (t *Tray) applyStatus(st services.Status) {
 	// Cache-only; the row is painted by the relayout below.
 	sessionChanged := t.applySessionExpiry(st.SessionExpiresAt, connected)
 
-	if iconChanged {
+	if iconChanged || stoppedDisconnecting {
 		t.applyIcon()
 	}
-	// All repainting goes through relayoutMenu (menuMu-serialised): applyStatus
-	// runs concurrently with itself and with relayouts, so in-place item
-	// mutation would race the buildMenu pointer swap.
-	if iconChanged || daemonVersionChanged || sessionChanged {
-		t.relayoutMenu()
+	// All repainting goes through refreshMenuState (menuMu-serialised):
+	// applyStatus runs concurrently with itself and with relayouts, so
+	// unguarded item mutation would race the buildMenu pointer swap. No rows
+	// change here, so on macOS this repaints the items in place and a menu the
+	// user has open follows the connection live.
+	if iconChanged || stoppedDisconnecting {
+		// Only on a connection change: the session countdown repaints every
+		// half minute, and taking the menu away from a reader for that would be
+		// worse than a stale minute count. Settled means the connection has
+		// arrived somewhere it will stay, which is what a reopened menu should
+		// be showing.
+		settled := !strings.EqualFold(st.Status, services.StatusConnecting)
+		t.handleConnectionChange(settled)
+	}
+	if iconChanged || daemonVersionChanged || sessionChanged || stoppedDisconnecting {
+		t.refreshMenuState()
 	}
 	// The revision is the only reliable signal: candidate routes never appear
 	// in the peer-status snapshot, so a removed exit node would go unnoticed.
@@ -96,21 +116,32 @@ func (t *Tray) consumePendingConnectLogin(status string) bool {
 	return false
 }
 
-// applyStatusIndicator sets the status dot bitmap. Call only from relayoutMenu
-// (menuMu held): on macOS the bitmap repaints via the relayout's trailing
-// SetMenu, not here — the tree is half-built.
-func (t *Tray) applyStatusIndicator(status string) {
-	if t.statusItem == nil {
+// applyStatusIndicator sets the status dot bitmap. Call only from the Wails
+// painter (menuMu held) — the menu is closed there, so the hop onto
+// the UI thread below is one AppKit actually runs.
+//
+// live distinguishes the two callers. During a relayout the tree is half-built
+// and the item has no platform impl yet, so the bitmap is recorded and rides
+// the relayout's trailing SetMenu. On the repaint path the item is live and the
+// setter reaches AppKit directly — and setMenuItemBitmap is the one darwin
+// setter Wails does not marshal onto the UI thread itself, so hop there first.
+func (t *Tray) applyStatusIndicator(item *application.MenuItem, bitmap []byte, live bool) {
+	if item == nil {
 		return
 	}
-	t.statusItem.SetBitmap(statusIndicatorBitmap(status))
+	if !live {
+		item.SetBitmap(bitmap)
+		return
+	}
+	application.InvokeSync(func() { item.SetBitmap(bitmap) })
 }
 
 func statusIndicatorBitmap(status string) []byte {
 	switch {
 	case strings.EqualFold(status, services.StatusConnected):
 		return iconMenuDotConnected
-	case strings.EqualFold(status, services.StatusConnecting):
+	case strings.EqualFold(status, services.StatusConnecting),
+		strings.EqualFold(status, statusDisconnecting):
 		return iconMenuDotConnecting
 	case strings.EqualFold(status, services.StatusNeedsLogin),
 		strings.EqualFold(status, services.StatusSessionExpired):

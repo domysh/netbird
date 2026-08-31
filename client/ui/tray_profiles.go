@@ -59,10 +59,11 @@ func (t *Tray) loadConfig() {
 	t.profileMu.Unlock()
 }
 
-// loadProfiles fetches the profile list and relayouts the menu. Also called
-// from applyStatus to catch flips from another channel (CLI, autoconnect),
-// since the daemon emits no active-profile event. Full relayout (not
-// Clear()+Add()) is required for KDE/Plasma — see relayoutMenu's doc comment.
+// loadProfiles fetches the profile list and relayouts the menu when the rows
+// moved. Also called from applyStatus to catch flips from another channel (CLI,
+// autoconnect), since the daemon emits no active-profile event. Full relayout
+// (not Clear()+Add()) is required for KDE/Plasma — see relayoutMenu's doc
+// comment.
 func (t *Tray) loadProfiles() {
 	t.profileLoadMu.Lock()
 	defer t.profileLoadMu.Unlock()
@@ -79,12 +80,47 @@ func (t *Tray) loadProfiles() {
 		return
 	}
 
+	// Sorted before caching so the comparison below sees a stable order —
+	// ListProfiles gives no ordering guarantee. fillProfileSubmenu sorts its
+	// own copy too, and stays the authority on row order.
+	sortProfiles(profiles)
+
 	t.profilesMu.Lock()
+	changed := !t.profilesLoaded || t.profilesUser != username || !equalProfiles(profiles, t.profiles)
 	t.profiles = profiles
 	t.profilesUser = username
+	t.profilesLoaded = true
 	t.profilesMu.Unlock()
 
+	// A relayout swaps the whole tree and so drops a menu the user has open
+	// (see refreshMenuState). applyStatus reloads profiles on every
+	// connect/disconnect, so skip the rebuild when the rows are unchanged —
+	// the common case, and the one that used to freeze the open menu mid-connect.
+	if !changed {
+		return
+	}
 	t.relayoutMenu()
+}
+
+func sortProfiles(profiles []services.Profile) {
+	sort.Slice(profiles, func(i, j int) bool {
+		if profiles[i].Name != profiles[j].Name {
+			return profiles[i].Name < profiles[j].Name
+		}
+		return profiles[i].ID < profiles[j].ID
+	})
+}
+
+func equalProfiles(a, b []services.Profile) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // fillProfileSubmenu paints cached profile rows into the freshly built submenu.
@@ -98,12 +134,7 @@ func (t *Tray) fillProfileSubmenu() {
 	username := t.profilesUser
 	t.profilesMu.Unlock()
 
-	sort.Slice(profiles, func(i, j int) bool {
-		if profiles[i].Name != profiles[j].Name {
-			return profiles[i].Name < profiles[j].Name
-		}
-		return profiles[i].ID < profiles[j].ID
-	})
+	sortProfiles(profiles)
 
 	// Wails' systray does not reliably propagate a disabled parent to its
 	// children on every platform, so disable each row explicitly.
@@ -144,8 +175,10 @@ func (t *Tray) fillProfileSubmenu() {
 	})
 	manageProfiles.SetEnabled(!disableProfiles)
 	log.Infof("tray fillProfileSubmenu: %d profile(s) for user %q, active=%q", len(profiles), username, activeName)
+	// The marker has to survive the retitle, or the row drops out of reach of
+	// the AppKit painter (see tray_native_menu_darwin.go).
 	if t.profileSubmenuItem != nil && activeName != "" {
-		t.profileSubmenuItem.SetLabel(activeName)
+		t.profileSubmenuItem.SetLabel(markLabel(rowProfiles, activeName))
 	}
 	if t.profileEmailItem != nil {
 		if activeEmail != "" {

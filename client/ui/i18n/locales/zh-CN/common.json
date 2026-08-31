@@ -17,6 +17,9 @@
     "tray.status.connecting": {
         "message": "正在连接"
     },
+    "tray.status.disconnecting": {
+        "message": "正在断开连接"
+    },
     "tray.status.needsLogin": {
         "message": "需要登录"
     },
@@ -53,11 +56,8 @@
     "tray.menu.open": {
         "message": "打开 NetBird"
     },
-    "tray.menu.connect": {
-        "message": "连接"
-    },
-    "tray.menu.disconnect": {
-        "message": "断开连接"
+    "tray.menu.connected": {
+        "message": "已连接"
     },
     "tray.menu.exitNode": {
         "message": "出口节点"

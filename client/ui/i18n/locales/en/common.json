@@ -23,6 +23,10 @@
         "message": "Connecting",
         "description": "Tray status: a connection is being established."
     },
+    "tray.status.disconnecting": {
+        "message": "Disconnecting",
+        "description": "Tray status: the connection is being taken down."
+    },
     "tray.status.needsLogin": {
         "message": "Login required",
         "description": "Tray status: the user must sign in before connecting."
@@ -71,13 +75,9 @@
         "message": "Open NetBird",
         "description": "Tray menu item that opens the main NetBird window. Keep short."
     },
-    "tray.menu.connect": {
-        "message": "Connect",
-        "description": "Tray menu item that connects to the network. Keep short."
-    },
-    "tray.menu.disconnect": {
-        "message": "Disconnect",
-        "description": "Tray menu item that disconnects from the network. Keep short."
+    "tray.menu.connected": {
+        "message": "Connected",
+        "description": "Tray menu switch that connects and disconnects the client. It is a checkbox: ticked while connected, unticked while disconnected. Label the state, not the action, and keep it identical to tray.status.connected."
     },
     "tray.menu.exitNode": {
         "message": "Exit Node",

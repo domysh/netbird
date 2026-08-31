@@ -17,6 +17,9 @@
     "tray.status.connecting": {
         "message": "Подключение"
     },
+    "tray.status.disconnecting": {
+        "message": "Отключение"
+    },
     "tray.status.needsLogin": {
         "message": "Требуется вход"
     },
@@ -53,11 +56,8 @@
     "tray.menu.open": {
         "message": "Открыть NetBird"
     },
-    "tray.menu.connect": {
-        "message": "Подключиться"
-    },
-    "tray.menu.disconnect": {
-        "message": "Отключиться"
+    "tray.menu.connected": {
+        "message": "Подключено"
     },
     "tray.menu.exitNode": {
         "message": "Выходной узел"

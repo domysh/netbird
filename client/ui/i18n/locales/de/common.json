@@ -17,6 +17,9 @@
     "tray.status.connecting": {
         "message": "Wird verbunden"
     },
+    "tray.status.disconnecting": {
+        "message": "Wird getrennt"
+    },
     "tray.status.needsLogin": {
         "message": "Anmeldung erforderlich"
     },
@@ -53,11 +56,8 @@
     "tray.menu.open": {
         "message": "NetBird öffnen"
     },
-    "tray.menu.connect": {
-        "message": "Verbinden"
-    },
-    "tray.menu.disconnect": {
-        "message": "Trennen"
+    "tray.menu.connected": {
+        "message": "Verbunden"
     },
     "tray.menu.exitNode": {
         "message": "Exit Node"
