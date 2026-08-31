@@ -53,11 +53,8 @@
     "tray.menu.open": {
         "message": "NetBird megnyitása"
     },
-    "tray.menu.connect": {
-        "message": "Csatlakozás"
-    },
-    "tray.menu.disconnect": {
-        "message": "Bontás"
+    "tray.menu.connected": {
+        "message": "Csatlakozva"
     },
     "tray.menu.exitNode": {
         "message": "Exit Node"

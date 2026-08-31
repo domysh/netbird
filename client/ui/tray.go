@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -35,6 +36,10 @@ const (
 
 	urlGitHubRepo = "https://github.com/netbirdio/netbird"
 	urlDocs       = "https://docs.netbird.io"
+
+	// brandName labels the connection switch. Not translated: it is the
+	// product's name in every locale.
+	brandName = "NetBird"
 )
 
 // TrayServices bundles the services the tray menu needs, grouped so NewTray
@@ -70,15 +75,18 @@ type Tray struct {
 
 	// menu and the *Item/*Submenu fields below are reassigned by buildMenu
 	// on every relayout — touch them only with menuMu held. Exceptions:
-	// the Connect/Disconnect OnClick closures capture their own item, and
+	// the connection switch's OnClick closure captures its own item, and
 	// refreshSessionExpiresLabel snapshots its item under menuMu.
 	menu       *application.Menu
 	statusItem *application.MenuItem
 	// sessionExpiresItem shows the SSO deadline as a remaining-time label,
 	// repainted by a 30s ticker.
 	sessionExpiresItem *application.MenuItem
-	upItem             *application.MenuItem
-	downItem           *application.MenuItem
+	// connectItem is the connection row: one switch that states the current
+	// state instead of a Connect/Disconnect pair that swap places. On macOS an
+	// AppKit switch is grafted onto it (see tray_switch_darwin.h); elsewhere it
+	// is the checkbox Wails draws.
+	connectItem        *application.MenuItem
 	exitNodeItem       *application.MenuItem
 	exitNodeSubmenu    *application.Menu
 	profileSubmenu     *application.Menu
@@ -136,9 +144,13 @@ type Tray struct {
 	// into a freshly built Profiles submenu, kept separate from the live
 	// submenu so a relayout always has a source to repaint from without
 	// re-hitting the daemon.
-	profilesMu   sync.Mutex
-	profiles     []services.Profile
-	profilesUser string
+	profilesMu sync.Mutex
+	profiles   []services.Profile
+	// profilesLoaded marks the first successful fetch, so loadProfiles can tell
+	// "no profiles yet" from "no profiles, and that is the answer" and relayout
+	// for the initial fill either way.
+	profilesLoaded bool
+	profilesUser   string
 
 	// menuMu serialises relayoutMenu (buildMenu + SetMenu) and guards the
 	// menu/item-pointer fields above. relayoutMenu is the only post-startup
@@ -146,10 +158,21 @@ type Tray struct {
 	// reinstall a stale tree.
 	menuMu sync.Mutex
 
+	// pendingRelayout records a rebuild that arrived while the user had the
+	// menu open, for onTrayMenuClosed to run once it is out of the way. Atomic
+	// rather than menuMu-guarded: relayoutMenu sets it before taking the lock.
+	pendingRelayout atomic.Bool
+
 	// exitNodesMu guards the exitNodes row cache so relayoutMenu's read (and
 	// the Repaint copy) doesn't contend with status-push readers of statusMu.
 	exitNodesMu sync.Mutex
 	exitNodes   []exitNodeEntry
+	// exitNodesShown is how many rows the submenu was last filled with, which
+	// trails exitNodes while a rebuild waits for an open menu to close.
+	exitNodesShown int
+	// exitNodesRows is that same fill, in order: a click on a natively painted
+	// row reports its position, and this is what turns it back into a node.
+	exitNodesRows []exitNodeEntry
 	// exitNodesRebuildMu serialises the ListNetworks fetch + submenu rebuild +
 	// SetMenu cycle so back-to-back Status pushes can't run it concurrently
 	// with itself.
@@ -190,6 +213,10 @@ func NewTray(app *application.App, window *application.WebviewWindow, svc TraySe
 	}
 	t.menu = t.buildMenu()
 	t.tray.SetMenu(t.menu)
+	// Adopts the connection row as an AppKit switch the next time the menu
+	// opens, drives the exit-node rows painted behind Wails' back, and reports
+	// the menu's own open/close. No-op off macOS.
+	startNativeMenu(t.handleConnectionSwitch, t.handleNativeExitNode, t.onTrayMenuOpened, t.onTrayMenuClosed)
 	// macOS/Linux give click→menu natively, so bindTrayClick is a no-op there
 	// (binding OnClick→OpenMenu on macOS would freeze the tray); Windows has no
 	// native left-click handler so it wires one to open the main window, leaving
@@ -311,23 +338,250 @@ func (t *Tray) applyLanguage() {
 // status/session/profile/exit-node state into the fresh items, and pushes the
 // whole tree with a single SetMenu.
 //
-// A full rebuild is required because on KDE/Plasma the StatusNotifierItem host
-// caches a submenu's layout on first open (GetLayout for that submenu id) and
-// never re-fetches it on a LayoutUpdated(parent=0) signal — so Clear()+Add()
-// into the same container froze both the visible rows and the click→id mapping,
-// and stale ids no-op'd. buildMenu allocates a fresh submenu container id each
-// time, which Plasma treats as unseen and re-queries (confirmed via
-// dbus-monitor). This also covers the darwin detached-NSMenu workaround, since
-// it rebuilds the whole tree against the cached top-level pointer.
+// A full rebuild is required whenever the *rows* change, because on KDE/Plasma
+// the StatusNotifierItem host caches a submenu's layout on first open
+// (GetLayout for that submenu id) and never re-fetches it on a
+// LayoutUpdated(parent=0) signal — so Clear()+Add() into the same container
+// froze both the visible rows and the click→id mapping, and stale ids no-op'd.
+// buildMenu allocates a fresh submenu container id each time, which Plasma
+// treats as unseen and re-queries (confirmed via dbus-monitor). This also
+// covers the darwin detached-NSMenu workaround, since it rebuilds the whole
+// tree against the cached top-level pointer.
+//
+// A rebuild is the wrong tool for a state change though: it discards the menu
+// the user may have open (see refreshMenuState), so callers that only move
+// state — a status push, a connect, a disconnect — go through refreshMenuState
+// instead, and callers whose row set is unchanged skip both.
 //
 // Rows come from the profilesMu/exitNodes caches, so it never re-hits the
 // daemon or recurses back into loadProfiles.
 func (t *Tray) relayoutMenu() {
+	// Not while the user is holding the menu open. A rebuild hands the tray a
+	// different native menu, and on macOS the one on screen is the one AppKit
+	// was given when it was clicked open: it would stay up but stop following
+	// the daemon, since every painter now points at the items of a tree nobody
+	// can see. Exit nodes appearing on connect and the profile list reloading
+	// both land in exactly that window, so the rebuild waits for the menu to
+	// close (see onTrayMenuClosed) while paintMenuState keeps the visible rows
+	// current. Off macOS trayMenuIsOpen is always false — the menu is never
+	// live there either way.
+	if trayMenuIsOpen() {
+		t.pendingRelayout.Store(true)
+		return
+	}
+
 	t.menuMu.Lock()
 	defer t.menuMu.Unlock()
 
 	t.menu = t.buildMenu()
+	t.paintMenuState(false)
 
+	// buildMenu recreated empty submenus, so repaint both from their caches
+	// before SetMenu. Neither fill re-fetches. Do NOT re-take
+	// exitNodesRebuildMu here — refreshExitNodes already holds it when it
+	// calls relayoutMenu.
+	t.fillExitNodeSubmenu(t.exitNodeEntries())
+	t.fillProfileSubmenu()
+
+	// Single push of the whole tree: on Linux one LayoutUpdated with fresh
+	// container ids; on darwin an NSMenu rebuild against the cached pointer.
+	t.tray.SetMenu(t.menu)
+}
+
+// onTrayMenuOpened repaints the rows from the daemon's state as the menu opens.
+// The rows come out of a Wails relayout carrying whatever the last paint left
+// on them, and this is the cheap moment to make sure what the user is about to
+// look at is the truth — a push that went missing cannot then sit there wrong
+// until the next status change.
+func (t *Tray) onTrayMenuOpened() {
+	t.refreshMenuState()
+}
+
+// onTrayMenuClosed applies what an open menu held back: the deferred rebuild,
+// and a refresh that puts Wails back in sync with what the native painter wrote
+// past. The loop catches a rebuild requested while this one ran, and stops if
+// the user reopens the menu.
+func (t *Tray) onTrayMenuClosed() {
+	t.applyIcon()
+	relaid := false
+	for !trayMenuIsOpen() && t.pendingRelayout.Swap(false) {
+		t.relayoutMenu()
+		relaid = true
+	}
+	if !relaid {
+		t.refreshMenuState()
+	}
+}
+
+// refreshMenuState repaints the rows that carry daemon state. Where the rows
+// can be written where they stand the paint lands in a menu the user already
+// has open; elsewhere only a full relayout reaches them (see relayoutMenu).
+func (t *Tray) refreshMenuState() {
+	if !livePaintMenu() {
+		t.relayoutMenu()
+		return
+	}
+	t.menuMu.Lock()
+	defer t.menuMu.Unlock()
+	t.paintMenuState(true)
+}
+
+// paintMenuState writes the cached daemon state onto the menu rows. Callers
+// must hold menuMu.
+//
+// live is true when the items are already installed in a menu the platform may
+// be showing, and false during a relayout, where buildMenu has just allocated
+// them and the platform layer attaches on the trailing SetMenu.
+func (t *Tray) paintMenuState(live bool) {
+	state := t.menuStateSnapshot()
+	p := t.painter(live)
+
+	p.connection(state.connectionLabel, state.switchOn, state.switchEnabled)
+	p.row(rowStatus, state.statusLabel, statusRowEnabled(), false, state.statusBitmap)
+	p.row(rowSession, state.sessionLabel, true, state.sessionLabel == "", nil)
+	p.row(rowExitNode, "", state.exitNodesEnabled, false, nil)
+	p.row(rowSettings, "", state.settingsEnabled, false, nil)
+	p.row(rowProfiles, "", state.profilesEnabled, false, nil)
+	p.submenuRows(state)
+}
+
+// menuRow names the rows the tray paints. Both painters address a row by this
+// name; the invisible marker one of them needs to find it is an implementation
+// detail of the AppKit side (see rowMarker).
+type menuRow int
+
+const (
+	rowConnection menuRow = iota
+	rowStatus
+	rowSession
+	rowExitNode
+	rowSettings
+	rowProfiles
+)
+
+// markLabel appends the marker that makes a row findable from AppKit. Every
+// writer of a row's label goes through it, or the row drops out of the native
+// painter's reach.
+func markLabel(row menuRow, label string) string { return label + rowMarker(row) }
+
+// menuPainter writes state onto the menu. Which implementation runs is a
+// moment-by-moment choice, not a platform one: the AppKit painter takes over
+// while a menu is open, because Wails' setters cannot land then (see
+// tray_native_menu_darwin.go).
+type menuPainter interface {
+	connection(label string, on, enabled bool)
+	row(row menuRow, label string, enabled, hidden bool, bitmap []byte)
+	exitNodes(labels []string)
+	trayIcon(icon, dark []byte)
+	// submenuRows paints what only Wails can reach: the rows nested inside the
+	// submenus. Nothing in there moves while the menu is open.
+	submenuRows(state menuState)
+}
+
+// painter picks the one that can reach the menu right now. live is false during
+// a relayout, where the items are freshly built and not yet installed, so Wails
+// is the only one that can carry state to them.
+func (t *Tray) painter(live bool) menuPainter {
+	// nativeMenu, not just an open menu: Windows knows when its popup is up
+	// too, but has no native painter behind it — picking the stub there threw
+	// away every repaint while the menu was open, the tray icon included.
+	if live && nativeMenu() && trayMenuIsOpen() {
+		return nativeMenuPainter{}
+	}
+	return wailsMenuPainter{tray: t, live: live}
+}
+
+// rowItem maps a row to the item buildMenu created for it. Callers must hold
+// menuMu. A row the platform does not have — the status row where the
+// connection row is a switch — has no item, and painting it is a no-op.
+func (t *Tray) rowItem(row menuRow) *application.MenuItem {
+	switch row {
+	case rowConnection:
+		return t.connectItem
+	case rowStatus:
+		return t.statusItem
+	case rowSession:
+		return t.sessionExpiresItem
+	case rowExitNode:
+		return t.exitNodeItem
+	case rowSettings:
+		return t.settingsItem
+	case rowProfiles:
+		return t.profileSubmenuItem
+	}
+	return nil
+}
+
+// wailsMenuPainter writes state through Wails, which owns the rows whenever the
+// menu is closed — and off macOS, always.
+type wailsMenuPainter struct {
+	tray *Tray
+	// live is false during a relayout: the items have no platform impl yet, so
+	// the status bitmap is recorded on the item and rides the trailing SetMenu
+	// instead of being pushed at AppKit directly.
+	live bool
+}
+
+func (p wailsMenuPainter) connection(label string, _, enabled bool) {
+	item := p.tray.connectItem
+	if item == nil {
+		return
+	}
+	item.SetLabel(markLabel(rowConnection, label))
+	item.SetEnabled(enabled)
+}
+
+func (p wailsMenuPainter) row(row menuRow, label string, enabled, hidden bool, bitmap []byte) {
+	item := p.tray.rowItem(row)
+	if item == nil {
+		return
+	}
+	// An empty label leaves the row's title alone: the fixed rows carry the one
+	// buildMenu gave them.
+	if label != "" {
+		item.SetLabel(markLabel(row, label))
+	}
+	item.SetEnabled(enabled)
+	item.SetHidden(hidden)
+	if bitmap != nil {
+		p.tray.applyStatusIndicator(item, bitmap, p.live)
+	}
+}
+
+// exitNodes does nothing here: off the AppKit path the rows arrive with the
+// rebuild relayoutMenu runs. Filling the submenu in place instead would freeze
+// it on the dbusmenu hosts — see relayoutMenu.
+func (wailsMenuPainter) exitNodes([]string) {}
+
+func (p wailsMenuPainter) submenuRows(state menuState) {
+	if state.daemonVersionLabel != "" && p.tray.daemonVersionItem != nil {
+		p.tray.daemonVersionItem.SetLabel(state.daemonVersionLabel)
+	}
+	if p.tray.updater != nil {
+		p.tray.updater.applyLanguage()
+	}
+}
+
+// menuState is the daemon state the rows show, gathered once so the two
+// painters below cannot drift apart.
+type menuState struct {
+	// connectionLabel is the connection row's own text: the status where that
+	// row is a switch, the fixed label where it is a checkbox.
+	connectionLabel string
+	statusLabel     string
+	statusBitmap    []byte
+	// sessionLabel is empty when no SSO deadline is known, which is also when
+	// the row is hidden.
+	sessionLabel       string
+	switchOn           bool
+	switchEnabled      bool
+	exitNodesEnabled   bool
+	settingsEnabled    bool
+	profilesEnabled    bool
+	daemonVersionLabel string
+}
+
+func (t *Tray) menuStateSnapshot() menuState {
 	t.statusMu.Lock()
 	connected := t.connected
 	lastStatus := t.lastStatus
@@ -338,95 +592,82 @@ func (t *Tray) relayoutMenu() {
 	sessionDeadline := t.sessionExpiresAt
 	t.sessionMu.Unlock()
 
-	t.exitNodesMu.Lock()
-	exitNodeEntries := append([]exitNodeEntry(nil), t.exitNodes...)
-	t.exitNodesMu.Unlock()
-
 	disableProfiles, disableNetworks := t.featuresDisabled()
 
 	daemonUnavailable := strings.EqualFold(lastStatus, services.StatusDaemonUnavailable)
 	connecting := strings.EqualFold(lastStatus, services.StatusConnecting)
 
-	if t.statusItem != nil && lastStatus != "" {
-		t.statusItem.SetLabel(t.loc.StatusLabel(lastStatus))
-		t.statusItem.SetEnabled(statusRowEnabled())
-		t.applyStatusIndicator(lastStatus)
-	}
-	if t.sessionExpiresItem != nil {
-		if sessionDeadline.IsZero() {
-			t.sessionExpiresItem.SetHidden(true)
-		} else {
-			t.sessionExpiresItem.SetLabel(t.sessionRowLabel(sessionDeadline))
-			t.sessionExpiresItem.SetHidden(false)
-		}
-	}
-	if t.upItem != nil {
-		// Connect stays visible in the NeedsLogin states too — Up drives
-		// the SSO re-auth flow; hidden only when it would be a no-op.
-		t.upItem.SetHidden(connected || connecting || daemonUnavailable)
-		t.upItem.SetEnabled(!connected && !connecting && !daemonUnavailable)
-	}
-	if t.downItem != nil {
-		// Disconnect doubles as the Connecting abort path.
-		t.downItem.SetHidden(!connected && !connecting)
-		t.downItem.SetEnabled(connected || connecting)
-	}
-	if t.exitNodeItem != nil {
-		t.exitNodeItem.SetEnabled(connected && len(exitNodeEntries) > 0 && !disableNetworks)
-	}
-	if t.settingsItem != nil {
-		t.settingsItem.SetEnabled(!daemonUnavailable)
-	}
-	if t.profileSubmenuItem != nil {
-		t.profileSubmenuItem.SetEnabled(!daemonUnavailable && !disableProfiles)
-	}
-	if daemonVersion != "" && t.daemonVersionItem != nil {
-		t.daemonVersionItem.SetLabel(t.loc.T("tray.menu.daemonVersion", "version", daemonVersion))
-	}
-	if t.updater != nil {
-		t.updater.applyLanguage()
-	}
-	// buildMenu recreated empty submenus, so repaint both from their caches
-	// before SetMenu. Neither fill re-fetches. Do NOT re-take
-	// exitNodesRebuildMu here — refreshExitNodes already holds it when it
-	// calls relayoutMenu.
-	t.fillExitNodeSubmenu(exitNodeEntries)
-	t.fillProfileSubmenu()
+	// On mid-connect too: the switch reads "on" from the moment it is flipped,
+	// and flipping it back aborts. It stays live in the NeedsLogin states — the
+	// flip drives the SSO re-auth flow there — and is greyed only when the
+	// daemon is gone and it would be a no-op.
+	switchOn := connected || connecting
 
-	// Single push of the whole tree: on Linux one LayoutUpdated with fresh
-	// container ids; on darwin an NSMenu rebuild against the cached pointer.
-	t.tray.SetMenu(t.menu)
+	state := menuState{
+		connectionLabel: t.connectionRowLabel(lastStatus, switchOn),
+		statusLabel:     t.loc.StatusLabel(lastStatus),
+		statusBitmap:    statusIndicatorBitmap(lastStatus),
+		switchOn:        switchOn,
+		switchEnabled:   !daemonUnavailable,
+		// The row count is the one the menu is actually showing, not the cache:
+		// the two part company while a rebuild waits for the menu to close, and
+		// enabling the row then would open an empty submenu.
+		exitNodesEnabled: connected && t.exitNodesInMenu() > 0 && !disableNetworks,
+		settingsEnabled:  !daemonUnavailable,
+		profilesEnabled:  !daemonUnavailable && !disableProfiles,
+	}
+	if !sessionDeadline.IsZero() {
+		state.sessionLabel = t.sessionRowLabel(sessionDeadline)
+	}
+	if daemonVersion != "" {
+		state.daemonVersionLabel = t.loc.T("tray.menu.daemonVersion", "version", daemonVersion)
+	}
+	return state
 }
 
 func (t *Tray) buildMenu() *application.Menu {
 	menu := application.NewMenu()
 
+	// The status row exists only where the connection row cannot carry the
+	// state itself. With a switch it can — its label is the status — and a
+	// second row repeating it, appearing and vanishing under the pointer as the
+	// connection moves, is noise. Dropping it also takes the menu's only image
+	// with it: one image anywhere in an NSMenu indents every title in it behind
+	// a gutter, which is what pushed the whole menu to the right.
+	//
 	// Enabled state is platform-dependent (see statusRowEnabled): Windows keeps
 	// it enabled because the disabled mask would desaturate the coloured status
 	// dot; macOS/Linux disable it so the greyed label signals it isn't
 	// clickable.
-	t.statusItem = menu.Add(t.loc.T("tray.status.disconnected")).
-		SetEnabled(statusRowEnabled()).
-		SetBitmap(iconMenuDotIdle)
+	if !nativeMenu() {
+		t.statusItem = menu.Add(markLabel(rowStatus, t.loc.T("tray.status.disconnected"))).
+			SetEnabled(statusRowEnabled()).
+			SetBitmap(iconMenuDotIdle)
 
-	menu.AddSeparator()
+		menu.AddSeparator()
+	}
 
-	// The OnClick closures capture the local item because t.upItem/t.downItem
-	// are menuMu-guarded and must not be read from the click goroutine.
-	upItem := menu.Add(t.loc.T("tray.menu.connect"))
-	upItem.OnClick(func(*application.Context) { t.handleConnect(upItem) })
-	t.upItem = upItem
-	downItem := menu.Add(t.loc.T("tray.menu.disconnect"))
-	downItem.OnClick(func(*application.Context) { t.handleDisconnect(downItem) })
-	downItem.SetHidden(true)
-	t.downItem = downItem
+	// One switch row rather than a Connect/Disconnect pair that hide each
+	// other: the row keeps its place and its label and only its state moves,
+	// which is what lets a menu that is already open follow the connection
+	// instead of restructuring under the cursor (see refreshMenuState).
+	//
+	// On macOS the row becomes a real AppKit switch, adopted through the marker
+	// in its label (see tray_native_menu_darwin.go); the checkbox below is what
+	// it is grafted onto, and what the other platforms keep. The OnClick
+	// closure captures the local item because t.connectItem is menuMu-guarded
+	// and must not be read from the click goroutine.
+	connectLabel := markLabel(rowConnection, t.connectionRowLabel(t.currentStatus(), t.connectedNow()))
+	connectItem := menu.Add(connectLabel)
+	connectItem.OnClick(func(*application.Context) { t.handleToggleConnection() })
+	t.connectItem = connectItem
 
 	menu.AddSeparator()
 
 	// Populated asynchronously once the app has started — Menu.Update() is a
 	// no-op before app.running is true, so the initial fill is gated on the
 	// ApplicationStarted hook.
-	profilesLabel := t.loc.T("tray.menu.profiles")
+	profilesLabel := markLabel(rowProfiles, t.loc.T("tray.menu.profiles"))
 	t.profileSubmenu = menu.AddSubmenu(profilesLabel)
 	// AddSubmenu returns the child *Menu, so retrieve the parent *MenuItem via
 	// FindByLabel.
@@ -435,7 +676,8 @@ func (t *Tray) buildMenu() *application.Menu {
 	t.profileEmailItem.SetHidden(true)
 	// Click opens the SessionExpiration window so the user can extend ahead of
 	// the daemon's T-FinalWarningLead auto-prompt.
-	t.sessionExpiresItem = menu.Add("").OnClick(func(*application.Context) { t.openSessionExtendFlow() })
+	t.sessionExpiresItem = menu.Add(markLabel(rowSession, "")).
+		OnClick(func(*application.Context) { t.openSessionExtendFlow() })
 	t.sessionExpiresItem.SetHidden(true)
 
 	menu.AddSeparator()
@@ -449,7 +691,7 @@ func (t *Tray) buildMenu() *application.Menu {
 	// exitNodeSubmenu hosts one row per peer advertising a default route
 	// (0.0.0.0/0 or ::/0). FindByLabel grabs the parent so applyStatus can flip
 	// its enabled state independently of the children.
-	exitNodeLabel := t.loc.T("tray.menu.exitNode")
+	exitNodeLabel := markLabel(rowExitNode, t.loc.T("tray.menu.exitNode"))
 	t.exitNodeSubmenu = menu.AddSubmenu(exitNodeLabel)
 	t.exitNodeItem = menu.FindByLabel(exitNodeLabel)
 	t.exitNodeItem.SetEnabled(false)
@@ -458,7 +700,7 @@ func (t *Tray) buildMenu() *application.Menu {
 
 	// The label's trailing ellipsis follows the macOS HIG convention for items
 	// that open a window.
-	t.settingsItem = menu.Add(t.loc.T("tray.menu.settings")).
+	t.settingsItem = menu.Add(markLabel(rowSettings, t.loc.T("tray.menu.settings"))).
 		SetAccelerator("CmdOrCtrl+,").
 		OnClick(func(*application.Context) { t.svc.WindowManager.OpenSettings("") })
 
@@ -511,28 +753,85 @@ func (t *Tray) handleQuit() {
 	t.app.Quit()
 }
 
-// handleConnect receives the clicked item from the buildMenu closure —
-// t.upItem is menuMu-guarded and must not be read here.
-func (t *Tray) handleConnect(upItem *application.MenuItem) {
+// handleToggleConnection drives the connection row where it is a plain item:
+// the label says what the click does, and the cached daemon state says which of
+// the two it is. Switching off doubles as the Connecting abort path.
+func (t *Tray) handleToggleConnection() {
+	t.statusMu.Lock()
+	status := t.lastStatus
+	connected := t.connected
+	t.statusMu.Unlock()
+
+	if connected || strings.EqualFold(status, services.StatusConnecting) {
+		t.handleDisconnect()
+		return
+	}
+	t.handleConnect(status)
+}
+
+// connectionRowLabel is the status next to a switch, which states the
+// connection and offers the control on one line, and a verb where there is no
+// switch, because there the status row above already does the stating.
+func (t *Tray) connectionRowLabel(status string, on bool) string {
+	if nativeMenu() {
+		return t.loc.StatusLabel(status)
+	}
+	if on {
+		return t.loc.T("quickActions.disconnect")
+	}
+	return t.loc.T("quickActions.connect")
+}
+
+// connectedNow reports whether the connection is up or coming up, which is what
+// the connection row's verb turns on.
+func (t *Tray) connectedNow() bool {
+	t.statusMu.Lock()
+	status := t.lastStatus
+	connected := t.connected
+	t.statusMu.Unlock()
+	return connected || strings.EqualFold(status, services.StatusConnecting)
+}
+
+// currentStatus snapshots the last status the daemon pushed.
+func (t *Tray) currentStatus() string {
+	t.statusMu.Lock()
+	defer t.statusMu.Unlock()
+	return t.lastStatus
+}
+
+// handleConnectionSwitch drives the AppKit switch row on macOS. Unlike the
+// checkbox path above, the state the user asked for is the one the control now
+// shows, so it is taken at face value: switching off doubles as the Connecting
+// abort, and the daemon's next push repaints the switch through
+// refreshMenuState if the request does not land.
+func (t *Tray) handleConnectionSwitch(on bool) {
+	if !on {
+		t.handleDisconnect()
+		return
+	}
+	t.statusMu.Lock()
+	status := t.lastStatus
+	t.statusMu.Unlock()
+	t.handleConnect(status)
+}
+
+// handleConnect brings the tunnel up from the status the switch was flipped in.
+func (t *Tray) handleConnect(status string) {
 	// NeedsLogin/SessionExpired/LoginFailed won't honor a plain Up RPC — they
 	// need the Login → WaitSSOLogin → Up sequence. Emit EventTriggerLogin so
 	// the React startLogin() (which owns the BrowserLogin popup) drives it;
 	// the WindowManager materialises a hidden main webview when none is live,
 	// so only the popup shows.
-	t.statusMu.Lock()
-	needsLogin := strings.EqualFold(t.lastStatus, services.StatusNeedsLogin) ||
-		strings.EqualFold(t.lastStatus, services.StatusSessionExpired) ||
-		strings.EqualFold(t.lastStatus, services.StatusLoginFailed)
-	t.statusMu.Unlock()
-	if needsLogin {
+	if strings.EqualFold(status, services.StatusNeedsLogin) ||
+		strings.EqualFold(status, services.StatusSessionExpired) ||
+		strings.EqualFold(status, services.StatusLoginFailed) {
 		t.app.Event.Emit(services.EventTriggerLogin)
 		return
 	}
-	upItem.SetEnabled(false)
 	// Arm the SSO auto-handoff: Up() is async and the daemon may flip to
 	// NeedsLogin on an SSO peer with no cached token. applyStatus consumes the
-	// flag on that transition to trigger browser-login without a second Connect
-	// click, and clears it on any terminal state.
+	// flag on that transition to trigger browser-login without a second flip of
+	// the switch, and clears it on any terminal state.
 	t.statusMu.Lock()
 	t.pendingConnectLogin = true
 	t.statusMu.Unlock()
@@ -543,18 +842,17 @@ func (t *Tray) handleConnect(upItem *application.MenuItem) {
 			t.statusMu.Lock()
 			t.pendingConnectLogin = false
 			t.statusMu.Unlock()
-			upItem.SetEnabled(true)
+			// Roll the switch back to what the daemon actually reports.
+			t.refreshMenuState()
 		}
 	}()
 }
 
 // handleDisconnect aborts any in-flight profile switch before sending Down —
 // otherwise the switcher's queued Up would reconnect right after, making the
-// click a no-op. Also clears Peers' optimistic-Connecting guard so the daemon's
+// flip a no-op. Also clears Peers' optimistic-Connecting guard so the daemon's
 // Idle push paints through instead of being swallowed by the suppression filter.
-// Receives the clicked item from the buildMenu closure (see handleConnect).
-func (t *Tray) handleDisconnect(downItem *application.MenuItem) {
-	downItem.SetEnabled(false)
+func (t *Tray) handleDisconnect() {
 	t.profileMu.Lock()
 	if t.switchCancel != nil {
 		t.switchCancel()
@@ -566,7 +864,7 @@ func (t *Tray) handleDisconnect(downItem *application.MenuItem) {
 		if err := t.svc.Connection.Down(context.Background()); err != nil {
 			log.Errorf("disconnect: %v", err)
 			t.notifyError(t.loc.T("notify.error.disconnect"))
-			downItem.SetEnabled(true)
+			t.refreshMenuState()
 		}
 	}()
 }

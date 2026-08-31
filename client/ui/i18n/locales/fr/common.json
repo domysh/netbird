@@ -53,11 +53,8 @@
     "tray.menu.open": {
         "message": "Ouvrir NetBird"
     },
-    "tray.menu.connect": {
-        "message": "Se connecter"
-    },
-    "tray.menu.disconnect": {
-        "message": "Se déconnecter"
+    "tray.menu.connected": {
+        "message": "Connecté"
     },
     "tray.menu.exitNode": {
         "message": "Nœud de sortie"

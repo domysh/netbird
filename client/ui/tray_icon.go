@@ -25,20 +25,29 @@ func (t *Tray) applyIcon() {
 		connected, hasUpdate, statusLabel, runtime.GOOS)
 
 	icon, dark := t.iconForState()
-	if runtime.GOOS == "darwin" {
-		t.tray.SetTemplateIcon(icon)
-		return
-	}
-	if runtime.GOOS == "linux" {
-		// Wails' Linux SNI backend ignores SetDarkModeIcon (last write wins
-		// over SetIcon), so iconForState already picked the silhouette by
-		// panel theme; push that single icon.
-		t.tray.SetIcon(icon)
-		return
-	}
-	t.tray.SetIcon(icon)
-	if dark != nil {
-		t.tray.SetDarkModeIcon(dark)
+	// Which painter takes it matters here: Wails hands the icon to the main
+	// dispatch queue, which AppKit stops draining while a menu tracks, so under
+	// an open menu the call would neither land nor return. The AppKit painter
+	// puts it in the menu bar directly, and onTrayMenuClosed re-pushes it
+	// through Wails once the menu is gone.
+	t.painter(true).trayIcon(icon, dark)
+}
+
+// trayIcon pushes the icon the way each platform wants it: macOS takes a single
+// template image and inverts it itself, Wails' Linux SNI backend ignores
+// SetDarkModeIcon so iconForState has already picked the silhouette by panel
+// theme, and Windows takes both.
+func (p wailsMenuPainter) trayIcon(icon, dark []byte) {
+	switch runtime.GOOS {
+	case "darwin":
+		p.tray.tray.SetTemplateIcon(icon)
+	case "linux":
+		p.tray.tray.SetIcon(icon)
+	default:
+		p.tray.tray.SetIcon(icon)
+		if dark != nil {
+			p.tray.tray.SetDarkModeIcon(dark)
+		}
 	}
 }
 

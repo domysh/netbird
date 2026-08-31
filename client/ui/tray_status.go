@@ -53,11 +53,13 @@ func (t *Tray) applyStatus(st services.Status) {
 	if iconChanged {
 		t.applyIcon()
 	}
-	// All repainting goes through relayoutMenu (menuMu-serialised): applyStatus
-	// runs concurrently with itself and with relayouts, so in-place item
-	// mutation would race the buildMenu pointer swap.
+	// All repainting goes through refreshMenuState (menuMu-serialised):
+	// applyStatus runs concurrently with itself and with relayouts, so
+	// unguarded item mutation would race the buildMenu pointer swap. No rows
+	// change here, so on macOS this repaints the items in place and a menu the
+	// user has open follows the connection live.
 	if iconChanged || daemonVersionChanged || sessionChanged {
-		t.relayoutMenu()
+		t.refreshMenuState()
 	}
 	// The revision is the only reliable signal: candidate routes never appear
 	// in the peer-status snapshot, so a removed exit node would go unnoticed.
@@ -96,14 +98,24 @@ func (t *Tray) consumePendingConnectLogin(status string) bool {
 	return false
 }
 
-// applyStatusIndicator sets the status dot bitmap. Call only from relayoutMenu
-// (menuMu held): on macOS the bitmap repaints via the relayout's trailing
-// SetMenu, not here — the tree is half-built.
-func (t *Tray) applyStatusIndicator(status string) {
-	if t.statusItem == nil {
+// applyStatusIndicator sets the status dot bitmap. Call only from the Wails
+// painter (menuMu held) — the menu is closed there, so the hop onto
+// the UI thread below is one AppKit actually runs.
+//
+// live distinguishes the two callers. During a relayout the tree is half-built
+// and the item has no platform impl yet, so the bitmap is recorded and rides
+// the relayout's trailing SetMenu. On the repaint path the item is live and the
+// setter reaches AppKit directly — and setMenuItemBitmap is the one darwin
+// setter Wails does not marshal onto the UI thread itself, so hop there first.
+func (t *Tray) applyStatusIndicator(item *application.MenuItem, bitmap []byte, live bool) {
+	if item == nil {
 		return
 	}
-	t.statusItem.SetBitmap(statusIndicatorBitmap(status))
+	if !live {
+		item.SetBitmap(bitmap)
+		return
+	}
+	application.InvokeSync(func() { item.SetBitmap(bitmap) })
 }
 
 func statusIndicatorBitmap(status string) []byte {

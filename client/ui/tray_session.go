@@ -102,19 +102,20 @@ func sessionRefreshInterval(remaining time.Duration) time.Duration {
 // refreshSessionExpiresLabel updates only the countdown label, no relayout, to avoid disturbing an open menu.
 // The item is snapshotted under menuMu since buildMenu reassigns it on every relayout.
 func (t *Tray) refreshSessionExpiresLabel() {
-	t.menuMu.Lock()
-	item := t.sessionExpiresItem
-	t.menuMu.Unlock()
-	if item == nil {
-		return
-	}
 	t.sessionMu.Lock()
 	deadline := t.sessionExpiresAt
 	t.sessionMu.Unlock()
 	if deadline.IsZero() {
 		return
 	}
-	item.SetLabel(t.sessionRowLabel(deadline))
+	label := t.sessionRowLabel(deadline)
+
+	// The countdown is the label most likely to move while the user is reading
+	// the menu, so it goes through the painter like everything else: AppKit
+	// while the menu is open, Wails when it is not.
+	t.menuMu.Lock()
+	defer t.menuMu.Unlock()
+	t.painter(true).row(rowSession, label, true, false, nil)
 }
 
 func (t *Tray) sessionRowLabel(deadline time.Time) string {
