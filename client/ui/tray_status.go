@@ -56,6 +56,12 @@ func (t *Tray) applyStatus(st services.Status) {
 	// All repainting goes through relayoutMenu (menuMu-serialised): applyStatus
 	// runs concurrently with itself and with relayouts, so in-place item
 	// mutation would race the buildMenu pointer swap.
+	if iconChanged {
+		// Only a connection change: the session countdown relayouts every half
+		// minute, and taking the menu away from a reader for that would be
+		// worse than a stale minute count.
+		t.handleConnectionChange(!strings.EqualFold(st.Status, services.StatusConnecting))
+	}
 	if iconChanged || daemonVersionChanged || sessionChanged {
 		t.relayoutMenu()
 	}

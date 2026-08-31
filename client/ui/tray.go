@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -145,6 +146,16 @@ type Tray struct {
 	// SetMenu call site — a menu snapshot pushed outside the lock could
 	// reinstall a stale tree.
 	menuMu sync.Mutex
+
+	// pendingRelayout holds a rebuild that arrived while the user had the menu
+	// open, for the watcher to run once it is gone. Atomic rather than
+	// menuMu-guarded: relayoutMenu sets it before taking the lock.
+	pendingRelayout atomic.Bool
+	// menuDismissedAt is when a connection change last took the menu away, so
+	// it can be handed back when the connection settles. Zero when there is
+	// nothing to hand back.
+	menuDismissedAt atomic.Int64
+	reopening       atomic.Bool
 
 	// exitNodesMu guards the exitNodes row cache so relayoutMenu's read (and
 	// the Repaint copy) doesn't contend with status-push readers of statusMu.
@@ -307,6 +318,60 @@ func (t *Tray) applyLanguage() {
 	t.relayoutMenu()
 }
 
+// menuReopenWindow bounds how stale a dismissal may be and still earn the menu
+// back: a popup reappearing long after the user stopped caring is worse than
+// one that never does.
+const menuReopenWindow = 30 * time.Second
+
+// onTrayMenuClosed runs the rebuild an open menu held back.
+func (t *Tray) onTrayMenuClosed() {
+	for !trayMenuIsOpen() && t.pendingRelayout.Swap(false) {
+		t.relayoutMenu()
+	}
+}
+
+// handleConnectionChange takes the menu away when the connection moves, because
+// Win32 will not redraw a popup that is already up, and hands it back once the
+// connection settles. A transient state only takes it away: there is nothing
+// worth reopening onto yet.
+func (t *Tray) handleConnectionChange(settled bool) {
+	if trayMenuIsOpen() {
+		dismissTrayMenu()
+		t.menuDismissedAt.Store(time.Now().UnixNano())
+		watchMenuClose(t.onTrayMenuClosed)
+	}
+	if !settled || !reopenAfterDismiss() {
+		return
+	}
+	if at := t.menuDismissedAt.Load(); at == 0 || time.Since(time.Unix(0, at)) > menuReopenWindow {
+		return
+	}
+	t.reopenTrayMenu()
+}
+
+// reopenTrayMenu waits for the dismissed menu to be gone, rebuilds it, and
+// shows it again. OpenMenu blocks for as long as the user keeps it up, hence
+// the goroutine.
+func (t *Tray) reopenTrayMenu() {
+	if !t.reopening.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer t.reopening.Store(false)
+
+		for i := 0; i < 25 && trayMenuIsOpen(); i++ {
+			time.Sleep(100 * time.Millisecond)
+		}
+		// Still up means the user opened it again themselves: leave it alone.
+		if trayMenuIsOpen() {
+			return
+		}
+		t.menuDismissedAt.Store(0)
+		t.relayoutMenu()
+		t.tray.OpenMenu()
+	}()
+}
+
 // relayoutMenu rebuilds the entire tray menu, repaints the cached
 // status/session/profile/exit-node state into the fresh items, and pushes the
 // whole tree with a single SetMenu.
@@ -323,6 +388,15 @@ func (t *Tray) applyLanguage() {
 // Rows come from the profilesMu/exitNodes caches, so it never re-hits the
 // daemon or recurses back into loadProfiles.
 func (t *Tray) relayoutMenu() {
+	// Not while the user has the menu open. On Windows a rebuild destroys the
+	// HMENU Win32 is tracking and the popup freezes; elsewhere trayMenuIsOpen
+	// is always false and this never fires.
+	if trayMenuIsOpen() {
+		t.pendingRelayout.Store(true)
+		watchMenuClose(t.onTrayMenuClosed)
+		return
+	}
+
 	t.menuMu.Lock()
 	defer t.menuMu.Unlock()
 
