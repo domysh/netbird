@@ -17,6 +17,9 @@
     "tray.status.connecting": {
         "message": "Conectando"
     },
+    "tray.status.disconnecting": {
+        "message": "Desconectando"
+    },
     "tray.status.needsLogin": {
         "message": "Inicio de sesión requerido"
     },

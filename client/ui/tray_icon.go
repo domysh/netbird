@@ -13,8 +13,7 @@ import (
 
 func (t *Tray) applyIcon() {
 	t.statusMu.Lock()
-	connected := t.connected
-	statusLabel := t.lastStatus
+	statusLabel, connected := t.effectiveStatusLocked()
 	t.statusMu.Unlock()
 	hasUpdate := false
 	if t.updater != nil {
@@ -53,15 +52,17 @@ func (t *Tray) panelIsDark() bool {
 
 func (t *Tray) iconForState() (icon, dark []byte) {
 	t.statusMu.Lock()
-	connected := t.connected
-	statusLabel := t.lastStatus
+	statusLabel, connected := t.effectiveStatusLocked()
 	t.statusMu.Unlock()
 	hasUpdate := false
 	if t.updater != nil {
 		hasUpdate = t.updater.hasUpdate()
 	}
 
-	connecting := strings.EqualFold(statusLabel, services.StatusConnecting)
+	// A disconnect in flight wears the connecting icon: something is moving,
+	// and the tunnel is no longer to be trusted.
+	connecting := strings.EqualFold(statusLabel, services.StatusConnecting) ||
+		strings.EqualFold(statusLabel, statusDisconnecting)
 	errored := strings.EqualFold(statusLabel, statusError) ||
 		strings.EqualFold(statusLabel, services.StatusDaemonUnavailable)
 	needsLogin := strings.EqualFold(statusLabel, services.StatusNeedsLogin) ||

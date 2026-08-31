@@ -17,6 +17,9 @@
     "tray.status.connecting": {
         "message": "Подключение"
     },
+    "tray.status.disconnecting": {
+        "message": "Отключение"
+    },
     "tray.status.needsLogin": {
         "message": "Требуется вход"
     },

@@ -30,6 +30,10 @@ const (
 	notifyIDMDMPolicy    = "netbird-mdm-policy"
 
 	statusError = "Error"
+	// statusDisconnecting is the other tray-only sentinel: the daemon has no
+	// such state — it reports Connected until the tunnel is down — so the tray
+	// supplies it for as long as a Down is in flight.
+	statusDisconnecting = "Disconnecting"
 
 	quitDownTimeout = 5 * time.Second
 
@@ -109,6 +113,9 @@ type Tray struct {
 	// Profile-switch reconnects are handled separately by
 	// DaemonFeed.statusStreamLoop.
 	pendingConnectLogin bool
+	// disconnecting marks a Down in flight. Without it a slow disconnect leaves
+	// the menu claiming a connection that is already going away.
+	disconnecting bool
 
 	// sessionMu guards the cached SSO deadline used by the session row.
 	// Independent of statusMu so the 30s ticker reader and the Status-push
@@ -329,8 +336,7 @@ func (t *Tray) relayoutMenu() {
 	t.menu = t.buildMenu()
 
 	t.statusMu.Lock()
-	connected := t.connected
-	lastStatus := t.lastStatus
+	lastStatus, connected := t.effectiveStatusLocked()
 	daemonVersion := t.lastDaemonVersion
 	t.statusMu.Unlock()
 
@@ -553,6 +559,16 @@ func (t *Tray) handleConnect(upItem *application.MenuItem) {
 // click a no-op. Also clears Peers' optimistic-Connecting guard so the daemon's
 // Idle push paints through instead of being swallowed by the suppression filter.
 // Receives the clicked item from the buildMenu closure (see handleConnect).
+// effectiveStatusLocked is the status the tray shows: the daemon's own, except
+// while a Down is in flight, where it reports the tray's own disconnecting
+// state rather than a connection that is on its way out. Must hold statusMu.
+func (t *Tray) effectiveStatusLocked() (status string, connected bool) {
+	if t.disconnecting {
+		return statusDisconnecting, false
+	}
+	return t.lastStatus, t.connected
+}
+
 func (t *Tray) handleDisconnect(downItem *application.MenuItem) {
 	downItem.SetEnabled(false)
 	t.profileMu.Lock()
@@ -562,12 +578,29 @@ func (t *Tray) handleDisconnect(downItem *application.MenuItem) {
 	}
 	t.profileMu.Unlock()
 	t.svc.DaemonFeed.CancelProfileSwitch()
+
+	// Down blocks until the daemon has taken the tunnel down, so the flag is
+	// raised for exactly that stretch.
+	t.statusMu.Lock()
+	t.disconnecting = true
+	t.statusMu.Unlock()
+	t.applyIcon()
+	t.relayoutMenu()
+
 	go func() {
-		if err := t.svc.Connection.Down(context.Background()); err != nil {
+		err := t.svc.Connection.Down(context.Background())
+
+		t.statusMu.Lock()
+		t.disconnecting = false
+		t.statusMu.Unlock()
+
+		if err != nil {
 			log.Errorf("disconnect: %v", err)
 			t.notifyError(t.loc.T("notify.error.disconnect"))
 			downItem.SetEnabled(true)
 		}
+		t.applyIcon()
+		t.relayoutMenu()
 	}()
 }
 

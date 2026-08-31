@@ -30,6 +30,14 @@ func (t *Tray) applyStatus(st services.Status) {
 	sessionExpiredEnter := strings.EqualFold(st.Status, services.StatusSessionExpired) &&
 		!strings.EqualFold(t.lastStatus, services.StatusSessionExpired)
 
+	// The daemon's word beats the tray's guess: once it reports the tunnel
+	// down, the disconnecting sentinel has nothing left to stand for.
+	stoppedDisconnecting := t.disconnecting && !connected &&
+		!strings.EqualFold(st.Status, services.StatusConnecting)
+	if stoppedDisconnecting {
+		t.disconnecting = false
+	}
+
 	triggerLogin := t.consumePendingConnectLogin(st.Status)
 
 	daemonVersionChanged := st.DaemonVersion != "" && st.DaemonVersion != t.lastDaemonVersion
@@ -50,13 +58,13 @@ func (t *Tray) applyStatus(st services.Status) {
 	// Cache-only; the row is painted by the relayout below.
 	sessionChanged := t.applySessionExpiry(st.SessionExpiresAt, connected)
 
-	if iconChanged {
+	if iconChanged || stoppedDisconnecting {
 		t.applyIcon()
 	}
 	// All repainting goes through relayoutMenu (menuMu-serialised): applyStatus
 	// runs concurrently with itself and with relayouts, so in-place item
 	// mutation would race the buildMenu pointer swap.
-	if iconChanged || daemonVersionChanged || sessionChanged {
+	if iconChanged || daemonVersionChanged || sessionChanged || stoppedDisconnecting {
 		t.relayoutMenu()
 	}
 	// The revision is the only reliable signal: candidate routes never appear
@@ -110,7 +118,8 @@ func statusIndicatorBitmap(status string) []byte {
 	switch {
 	case strings.EqualFold(status, services.StatusConnected):
 		return iconMenuDotConnected
-	case strings.EqualFold(status, services.StatusConnecting):
+	case strings.EqualFold(status, services.StatusConnecting),
+		strings.EqualFold(status, statusDisconnecting):
 		return iconMenuDotConnecting
 	case strings.EqualFold(status, services.StatusNeedsLogin),
 		strings.EqualFold(status, services.StatusSessionExpired):

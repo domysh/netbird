@@ -17,6 +17,9 @@
     "tray.status.connecting": {
         "message": "正在连接"
     },
+    "tray.status.disconnecting": {
+        "message": "正在断开连接"
+    },
     "tray.status.needsLogin": {
         "message": "需要登录"
     },

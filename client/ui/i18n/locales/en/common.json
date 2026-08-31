@@ -23,6 +23,10 @@
         "message": "Connecting",
         "description": "Tray status: a connection is being established."
     },
+    "tray.status.disconnecting": {
+        "message": "Disconnecting",
+        "description": "Tray status: the connection is being taken down."
+    },
     "tray.status.needsLogin": {
         "message": "Login required",
         "description": "Tray status: the user must sign in before connecting."
