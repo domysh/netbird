@@ -17,6 +17,9 @@
     "tray.status.connecting": {
         "message": "Csatlakozás"
     },
+    "tray.status.disconnecting": {
+        "message": "Lecsatlakozás"
+    },
     "tray.status.needsLogin": {
         "message": "Bejelentkezés szükséges"
     },
@@ -53,11 +56,8 @@
     "tray.menu.open": {
         "message": "NetBird megnyitása"
     },
-    "tray.menu.connect": {
-        "message": "Csatlakozás"
-    },
-    "tray.menu.disconnect": {
-        "message": "Bontás"
+    "tray.menu.connected": {
+        "message": "Csatlakozva"
     },
     "tray.menu.exitNode": {
         "message": "Exit Node"

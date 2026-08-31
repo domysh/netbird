@@ -17,6 +17,9 @@
     "tray.status.connecting": {
         "message": "Conectando"
     },
+    "tray.status.disconnecting": {
+        "message": "Desconectando"
+    },
     "tray.status.needsLogin": {
         "message": "Inicio de sesión requerido"
     },
@@ -53,11 +56,8 @@
     "tray.menu.open": {
         "message": "Abrir NetBird"
     },
-    "tray.menu.connect": {
-        "message": "Conectar"
-    },
-    "tray.menu.disconnect": {
-        "message": "Desconectar"
+    "tray.menu.connected": {
+        "message": "Conectado"
     },
     "tray.menu.exitNode": {
         "message": "Nodo de salida"

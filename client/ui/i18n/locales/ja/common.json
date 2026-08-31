@@ -17,6 +17,9 @@
     "tray.status.connecting": {
         "message": "接続中"
     },
+    "tray.status.disconnecting": {
+        "message": "切断中"
+    },
     "tray.status.needsLogin": {
         "message": "ログインが必要"
     },
@@ -53,11 +56,8 @@
     "tray.menu.open": {
         "message": "NetBird を開く"
     },
-    "tray.menu.connect": {
-        "message": "接続"
-    },
-    "tray.menu.disconnect": {
-        "message": "切断"
+    "tray.menu.connected": {
+        "message": "接続済み"
     },
     "tray.menu.exitNode": {
         "message": "出口ノード"
