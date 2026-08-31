@@ -217,9 +217,12 @@ jobs:
           Built from ${GITHUB_SHA}. Unsigned development build: macOS is ad-hoc
           signed and Windows warns on first run."
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
-            gh release edit "$TAG" --notes "$BODY" --prerelease
+          # This job does not check the repository out, so gh is told which one
+          # it is working against.
+          REPO="--repo $GITHUB_REPOSITORY"
+          if gh release view $REPO "$TAG" >/dev/null 2>&1; then
+            gh release upload $REPO "$TAG" dist/* --clobber
+            gh release edit $REPO "$TAG" --notes "$BODY" --prerelease
           else
-            gh release create "$TAG" --title "$TAG" --notes "$BODY" --prerelease dist/*
+            gh release create $REPO "$TAG" --title "$TAG" --notes "$BODY" --prerelease dist/*
           fi
