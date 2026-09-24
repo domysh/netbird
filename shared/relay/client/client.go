@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"net/url"
@@ -26,6 +27,11 @@ const (
 	bufferSize            = 8820
 	serverResponseTimeout = 8 * time.Second
 	connChannelSize       = 100
+
+	// closeWriteTimeout bounds the control messages written while tearing a
+	// connection down. They are written under c.mu, and on a dead path a TCP
+	// write only fails once the kernel stops retransmitting, minutes later.
+	closeWriteTimeout = 3 * time.Second
 )
 
 var (
@@ -873,9 +879,29 @@ func (c *Client) notifyDisconnected() {
 
 func (c *Client) writeCloseMsg() {
 	msg := messages.MarshalCloseMsg()
-	_, err := c.relayConn.Write(msg)
-	if err != nil {
+	if err := writeBounded(c.relayConn, msg, closeWriteTimeout); err != nil {
 		c.log.Errorf("failed to send close message: %s", err)
+	}
+}
+
+// writeBounded writes msg to w but stops waiting after timeout, since neither
+// the WebSocket nor the QUIC relay connection supports write deadlines. A
+// write still pending is released once the connection is closed.
+func writeBounded(w io.Writer, msg []byte, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.Write(msg)
+		done <- err
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("write not completed within %s", timeout)
 	}
 }
 

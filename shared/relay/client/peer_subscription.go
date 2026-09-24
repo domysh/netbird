@@ -181,11 +181,13 @@ func (s *PeersStateSubscription) unsubscribeStateChange(peerIDs []messages.PeerI
 		return err
 	}
 
-	var connWriteErr error
+	// Unsubscribing runs while closing connections, under the client lock.
+	// After one write failed or stalled, the rest would only wait out their
+	// own bound.
 	for _, msg := range msgs {
-		if _, err := s.relayConn.Write(msg); err != nil {
-			connWriteErr = err
+		if err := writeBounded(s.relayConn, msg, closeWriteTimeout); err != nil {
+			return err
 		}
 	}
-	return connWriteErr
+	return nil
 }
