@@ -237,7 +237,15 @@ func (r *SysOps) genericAddVPNRoute(prefix netip.Prefix, intf *net.Interface) er
 
 		return nil
 	case vars.Defaultv6:
-		return r.addV6SplitDefault(nextHop)
+		if err := r.addV6SplitDefault(nextHop); err != nil {
+			return err
+		}
+		// Soft-fail: routing already works, only AAAA resolution on macOS
+		// depends on the announcement.
+		if err := r.announceV6Default(intf); err != nil {
+			log.Warnf("failed to announce v6 default: %v", err)
+		}
+		return nil
 	}
 
 	return r.addToRouteTable(prefix, nextHop)
@@ -264,7 +272,11 @@ func (r *SysOps) genericRemoveVPNRoute(prefix netip.Prefix, intf *net.Interface)
 
 		return nberrors.FormatErrorOrNil(result)
 	case vars.Defaultv6:
-		return nberrors.FormatErrorOrNil(r.removeV6SplitDefault(nextHop))
+		result := r.removeV6SplitDefault(nextHop)
+		if err := r.withdrawV6Default(); err != nil {
+			result = multierror.Append(result, err)
+		}
+		return nberrors.FormatErrorOrNil(result)
 	default:
 		return r.removeFromRouteTable(prefix, nextHop)
 	}

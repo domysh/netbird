@@ -88,6 +88,12 @@ func (r *SysOps) installScopedDefaultFor(unspec netip.Addr) (bool, error) {
 	if nexthop.Intf == nil {
 		return false, fmt.Errorf("unusable default nexthop for %s (no interface)", unspec)
 	}
+	// configd routes the default through the overlay while it is the primary
+	// v6 service; binding our own sockets there would loop them into the tunnel.
+	if r.wgInterface != nil && nexthop.Intf.Name == r.wgInterface.Name() {
+		log.Debugf("default nexthop for %s is the NetBird interface, skipping scoped default", afOf(unspec))
+		return false, nil
+	}
 
 	reused := false
 	if err := r.addScopedDefault(unspec, nexthop); err != nil {
@@ -127,7 +133,14 @@ func (r *SysOps) cleanupAdvancedRouting() error {
 // generic FlushMarkedRoutes path, so a crashed daemon's scoped defaults get
 // removed on the next boot regardless of whether a profile is brought up.
 func (r *SysOps) flushPlatformExtras() error {
-	return r.flushScopedDefaults()
+	var merr *multierror.Error
+	if err := r.flushScopedDefaults(); err != nil {
+		merr = multierror.Append(merr, err)
+	}
+	if err := r.withdrawV6Default(); err != nil {
+		merr = multierror.Append(merr, err)
+	}
+	return nberrors.FormatErrorOrNil(merr)
 }
 
 // flushScopedDefaults removes any scoped default routes tagged with routeProtoFlag.
