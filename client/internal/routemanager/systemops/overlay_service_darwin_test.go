@@ -11,13 +11,13 @@ import (
 
 func TestBuildOverlayV6ServiceCommands(t *testing.T) {
 	// The rank must be set before the IPv6 entity so configd never elects the
-	// overlay at the default rank, and the router is the overlay address so the
+	// overlay at the default rank and demotes it, and the router is the overlay address so the
 	// default route is on-link for the point-to-point utun.
 	got := buildOverlayV6ServiceCommands("utun100", netip.MustParsePrefix("fd00:1234::5/64"))
 
 	want := "open\n" +
 		"d.init\n" +
-		"d.add PrimaryRank Last\n" +
+		"d.add PrimaryRank First\n" +
 		"set State:/Network/Service/NetBird-Overlay\n" +
 		"d.init\n" +
 		"d.add InterfaceName utun100\n" +
