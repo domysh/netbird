@@ -21,10 +21,12 @@ const (
 	overlayServiceKey     = "State:/Network/Service/NetBird-Overlay"
 	overlayServiceIPv6Key = overlayServiceKey + "/IPv6"
 
-	// overlayPrimaryRank keeps a physical IPv6 service primary when there is
-	// one, so the overlay only becomes the IPv6 primary where it is the sole
-	// IPv6 path.
-	overlayPrimaryRank = "Last"
+	// overlayPrimaryRank must be First: configd couples a service's IPv4 and
+	// IPv6, so an IPv6-only service ranked below the IPv4 primary on another
+	// interface is demoted to scoped-only and ignored for the AAAA flag
+	// (ElectionResultsCandidateNeedsDemotion). NetworkExtension VPNs carrying
+	// the default route get the same rank through OverridePrimary.
+	overlayPrimaryRank = "First"
 )
 
 // announceV6Default publishes the overlay to configd as an IPv6 service with a
