@@ -235,16 +235,15 @@ func (r *SysOps) genericAddVPNRoute(prefix netip.Prefix, intf *net.Interface) er
 			}
 		}
 
+		r.setOverlayDefault(prefix, intf, true)
 		return nil
 	case vars.Defaultv6:
 		if err := r.addV6SplitDefault(nextHop); err != nil {
 			return err
 		}
-		// Soft-fail: routing already works, only AAAA resolution on macOS
-		// depends on the announcement.
-		if err := r.announceV6Default(intf); err != nil {
-			log.Warnf("failed to announce v6 default: %v", err)
-		}
+		// macOS only resolves AAAA on an IPv4-only network once the overlay is
+		// the primary network service, which needs both defaults routed here.
+		r.setOverlayDefault(prefix, intf, true)
 		return nil
 	}
 
@@ -258,6 +257,10 @@ func (r *SysOps) genericRemoveVPNRoute(prefix netip.Prefix, intf *net.Interface)
 
 	switch prefix {
 	case vars.Defaultv4:
+		// Withdraw the overlay first so the physical default is back before
+		// the split routes go.
+		r.setOverlayDefault(prefix, intf, false)
+
 		var result *multierror.Error
 		if err := r.removeFromRouteTable(splitDefaultv4_1, nextHop); err != nil {
 			result = multierror.Append(result, err)
@@ -272,11 +275,8 @@ func (r *SysOps) genericRemoveVPNRoute(prefix netip.Prefix, intf *net.Interface)
 
 		return nberrors.FormatErrorOrNil(result)
 	case vars.Defaultv6:
-		result := r.removeV6SplitDefault(nextHop)
-		if err := r.withdrawV6Default(); err != nil {
-			result = multierror.Append(result, err)
-		}
-		return nberrors.FormatErrorOrNil(result)
+		r.setOverlayDefault(prefix, intf, false)
+		return nberrors.FormatErrorOrNil(r.removeV6SplitDefault(nextHop))
 	default:
 		return r.removeFromRouteTable(prefix, nextHop)
 	}

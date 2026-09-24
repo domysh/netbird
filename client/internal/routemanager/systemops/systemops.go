@@ -78,6 +78,14 @@ type SysOps struct {
 	//nolint:unused // only used on BSD systems
 	seq atomic.Uint32
 
+	// physicalDefaults holds the physical default nexthop of each address family
+	// that a scoped default was installed through.
+	//nolint:unused // only used on darwin
+	physicalDefaults struct {
+		mu     sync.Mutex
+		v4, v6 Nexthop
+	}
+
 	localSubnetsCache     []*net.IPNet
 	localSubnetsCacheMu   sync.RWMutex
 	localSubnetsCacheTime time.Time
