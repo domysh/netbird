@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/netbirdio/netbird/client/internal/routemanager/systemops"
 	"github.com/netbirdio/netbird/client/internal/statemanager"
 )
 
@@ -606,4 +607,28 @@ func TestOriginalNameserversRouteAllTransition(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPhysicalPrimaryService(t *testing.T) {
+	promoted := systemops.OverlayPrimaryState{Active: true, PhysicalService: "PHYS-SERVICE"}
+
+	got, err := physicalPrimaryService("PHYS-SERVICE", systemops.OverlayPrimaryState{})
+	require.NoError(t, err)
+	assert.Equal(t, "PHYS-SERVICE", got, "a physical primary is used as is")
+
+	got, err = physicalPrimaryService(systemops.OverlayServiceID, promoted)
+	require.NoError(t, err)
+	assert.Equal(t, "PHYS-SERVICE", got, "the overlay's DNS is NetBird itself, so the displaced physical service is read")
+
+	_, err = physicalPrimaryService(systemops.OverlayServiceID, systemops.OverlayPrimaryState{Active: true})
+	assert.Error(t, err, "the overlay must never be taken as the physical service")
+}
+
+func TestResolverAddrPort(t *testing.T) {
+	ip := netip.MustParseAddr("100.91.255.254")
+
+	assert.Equal(t, netip.AddrPortFrom(ip, 53), resolverAddrPort(HostDNSConfig{ServerIP: ip, ServerPort: 53}))
+	assert.Equal(t, netip.AddrPortFrom(ip, 5053), resolverAddrPort(HostDNSConfig{ServerIP: ip, ServerPort: 5053}))
+	assert.False(t, resolverAddrPort(HostDNSConfig{ServerIP: ip, ServerPort: 70000}).IsValid(), "an out of range port yields no resolver")
+	assert.False(t, resolverAddrPort(HostDNSConfig{ServerPort: 53}).IsValid(), "a missing address yields no resolver")
 }
