@@ -8,6 +8,8 @@ import (
 	"net/netip"
 	"os/exec"
 	"strings"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -35,17 +37,31 @@ const (
 // asking for AAAA records even though the tunnel carries IPv6.
 func (r *SysOps) announceV6Default(intf *net.Interface) error {
 	if r.wgInterface == nil || intf == nil {
+		log.Infof("not announcing v6 default: no interface")
 		return nil
 	}
 
 	addr := r.wgInterface.Address()
 	if !addr.HasIPv6() {
+		log.Infof("not announcing v6 default: %s has no IPv6 overlay address", intf.Name)
 		return nil
 	}
 
 	if err := runScutil(buildOverlayV6ServiceCommands(intf.Name, addr.IPv6Prefix())); err != nil {
 		return fmt.Errorf("publish overlay IPv6 service: %w", err)
 	}
+
+	// scutil exits 0 even when a command in the script fails, so read the
+	// entity back to know whether configd actually has it.
+	out, err := runScutilOutput(fmt.Sprintf("open\nshow %s\nquit\n", overlayServiceIPv6Key))
+	if err != nil {
+		return fmt.Errorf("read back overlay IPv6 service: %w", err)
+	}
+	if !strings.Contains(out, "Router") {
+		return fmt.Errorf("overlay IPv6 service missing after publish: %s", strings.TrimSpace(out))
+	}
+
+	log.Infof("announced %s as IPv6 service with default route to the system resolver", intf.Name)
 	return nil
 }
 
@@ -56,6 +72,7 @@ func (r *SysOps) withdrawV6Default() error {
 	if err := runScutil(buildOverlayV6WithdrawCommands()); err != nil {
 		return fmt.Errorf("remove overlay IPv6 service: %w", err)
 	}
+	log.Debugf("withdrew overlay IPv6 service")
 	return nil
 }
 
@@ -88,10 +105,16 @@ func buildOverlayV6WithdrawCommands() string {
 }
 
 func runScutil(commands string) error {
+	_, err := runScutilOutput(commands)
+	return err
+}
+
+func runScutilOutput(commands string) (string, error) {
 	cmd := exec.Command(scutilPath)
 	cmd.Stdin = strings.NewReader(commands)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("run scutil: %w, output: %s", err, out)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("run scutil: %w, output: %s", err, out)
 	}
-	return nil
+	return string(out), nil
 }
