@@ -26,5 +26,7 @@ func checkChange(ctx context.Context, nexthopv4, nexthopv6 systemops.Nexthop) er
 		}
 	}()
 
-	return routeCheck(ctx, fd, nexthopv4, nexthopv6)
+	return routeCheck(ctx, fd, func(ev defaultRouteEvent) bool {
+		return defaultRouteChanged(ev, nexthopv4, nexthopv6)
+	})
 }

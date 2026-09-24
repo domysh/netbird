@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"syscall"
 	"unsafe"
 
@@ -20,7 +21,30 @@ func prepareFd() (int, error) {
 	return unix.Socket(syscall.AF_ROUTE, syscall.SOCK_RAW, syscall.AF_UNSPEC)
 }
 
-func routeCheck(ctx context.Context, fd int, nexthopv4, nexthopv6 systemops.Nexthop) error {
+// defaultRouteEvent is a default route added to or removed from the routing
+// table, as read from the routing socket.
+type defaultRouteEvent struct {
+	msgType int
+	flags   int
+	dst     netip.Prefix
+	gw      netip.Addr
+	// ifIndex is the link of an interface route, or else the index the kernel
+	// reported, which for an RTF_IFSCOPE route is its scope. Zero when unknown.
+	ifIndex int
+	ifName  string
+}
+
+func (e defaultRouteEvent) String() string {
+	intf := e.ifName
+	if intf == "" {
+		intf = "<nil>"
+	}
+	return fmt.Sprintf("via %s, interface %s, flags %#x", e.gw, intf, e.flags)
+}
+
+// routeCheck returns once isChange reports a default route event as a network
+// change.
+func routeCheck(ctx context.Context, fd int, isChange func(defaultRouteEvent) bool) error {
 	for {
 		// Wait until fd is readable or context is cancelled, to avoid a busy-loop
 		// when the routing socket returns EAGAIN (e.g. immediately after wakeup).
@@ -50,58 +74,75 @@ func routeCheck(ctx context.Context, fd int, nexthopv4, nexthopv6 systemops.Next
 		switch msg.Type {
 		// handle route changes
 		case unix.RTM_ADD, syscall.RTM_DELETE:
-			route, flags, err := parseRouteMessage(buf[:n])
+			ev, err := parseRouteMessage(buf[:n])
 			if err != nil {
 				log.Debugf("Network monitor: error parsing routing message: %v", err)
 				continue
 			}
 
-			if route.Dst.Bits() != 0 {
+			if ev.dst.Bits() != 0 {
 				continue
 			}
 
-			intf := "<nil>"
-			if route.Interface != nil {
-				intf = route.Interface.Name
-			}
-			switch msg.Type {
-			case unix.RTM_ADD:
-				if systemops.IgnoreAddedDefaultRoute(flags) {
-					log.Debugf("Network monitor: ignoring added default route via %s, interface %s, flags %#x", route.Gw, intf, flags)
-					continue
-				}
-				log.Infof("Network monitor: default route changed: via %s, interface %s", route.Gw, intf)
+			if isChange(ev) {
 				return nil
-			case unix.RTM_DELETE:
-				if nexthopv4.Intf != nil && route.Gw.Compare(nexthopv4.IP) == 0 || nexthopv6.Intf != nil && route.Gw.Compare(nexthopv6.IP) == 0 {
-					log.Infof("Network monitor: default route removed: via %s, interface %s", route.Gw, intf)
-					return nil
-				}
 			}
 		}
 	}
 }
 
-func parseRouteMessage(buf []byte) (*systemops.Route, int, error) {
+// defaultRouteChanged reports whether a default route event changes the way
+// out of the host, compared to the default nexthops captured when monitoring
+// started.
+func defaultRouteChanged(ev defaultRouteEvent, nexthopv4, nexthopv6 systemops.Nexthop) bool {
+	switch ev.msgType {
+	case unix.RTM_ADD:
+		if systemops.IgnoreAddedDefaultRoute(ev.flags) {
+			log.Debugf("Network monitor: ignoring added default route %s", ev)
+			return false
+		}
+		log.Infof("Network monitor: default route changed: %s", ev)
+		return true
+	case unix.RTM_DELETE:
+		if nexthopv4.Intf != nil && ev.gw.Compare(nexthopv4.IP) == 0 || nexthopv6.Intf != nil && ev.gw.Compare(nexthopv6.IP) == 0 {
+			log.Infof("Network monitor: default route removed: %s", ev)
+			return true
+		}
+	}
+	return false
+}
+
+func parseRouteMessage(buf []byte) (defaultRouteEvent, error) {
 	msgs, err := route.ParseRIB(route.RIBTypeRoute, buf)
 	if err != nil {
-		return nil, 0, fmt.Errorf("parse RIB: %v", err)
+		return defaultRouteEvent{}, fmt.Errorf("parse RIB: %v", err)
 	}
 
 	if len(msgs) != 1 {
-		return nil, 0, fmt.Errorf("unexpected RIB message msgs: %v", msgs)
+		return defaultRouteEvent{}, fmt.Errorf("unexpected RIB message msgs: %v", msgs)
 	}
 
 	msg, ok := msgs[0].(*route.RouteMessage)
 	if !ok {
-		return nil, 0, fmt.Errorf("unexpected RIB message type: %T", msgs[0])
+		return defaultRouteEvent{}, fmt.Errorf("unexpected RIB message type: %T", msgs[0])
 	}
 
 	r, err := systemops.MsgToRoute(msg)
 	if err != nil {
-		return nil, 0, err
+		return defaultRouteEvent{}, err
 	}
-	return r, msg.Flags, nil
+
+	ev := defaultRouteEvent{
+		msgType: msg.Type,
+		flags:   msg.Flags,
+		dst:     r.Dst,
+		gw:      r.Gw,
+		ifIndex: msg.Index,
+	}
+	if r.Interface != nil {
+		ev.ifIndex, ev.ifName = r.Interface.Index, r.Interface.Name
+	}
+	return ev, nil
 }
 
 // waitReadable blocks until fd has data to read, or ctx is cancelled.

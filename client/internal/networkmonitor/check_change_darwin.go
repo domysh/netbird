@@ -32,9 +32,13 @@ func checkChange(ctx context.Context, nexthopv4, nexthopv6 systemops.Nexthop) er
 		}
 	}()
 
+	nexthopv4, nexthopv6 = physicalNexthops(nexthopv4, nexthopv6, systemops.OverlayPrimary())
+
 	routeChanged := make(chan struct{})
 	go func() {
-		_ = routeCheck(ctx, fd, nexthopv4, nexthopv6)
+		_ = routeCheck(ctx, fd, func(ev defaultRouteEvent) bool {
+			return isNetworkChange(ev, nexthopv4, nexthopv6, systemops.OverlayPrimary(), time.Now())
+		})
 		close(routeChanged)
 	}()
 
