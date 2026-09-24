@@ -1,0 +1,135 @@
+# This workflow exists only on this fork. It keeps main in step with
+# netbirdio/netbird while preserving the fork's own commits, and keeps every
+# upstream workflow disabled here so they stop filling the runner queue.
+#
+# Conventions:
+# - Workflow files named fork-*.yml belong to the fork and stay enabled.
+#   Everything else is upstream CI, which runs on upstream's PRs anyway.
+# - Only main is touched. Topic branches (the ones proposed upstream) are left
+#   exactly as they are.
+# - Upstream is merged, never rebased, so main is never force-pushed.
+#
+# Needs a FORK_SYNC_TOKEN secret: a fine-grained token for this repository with
+# "Contents" and "Workflows" read/write. GitHub refuses a push carrying
+# workflow file changes from the default GITHUB_TOKEN, and upstream commits
+# touch .github/workflows regularly.
+
+name: Sync with upstream (fork only)
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+  # Runs once when this file lands on main, so the upstream workflows get
+  # disabled right away instead of at the next scheduled run.
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/fork-sync.yml
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: netbirdio/netbird
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: main
+
+jobs:
+  sync:
+    name: "Merge upstream into main"
+    if: github.repository != 'netbirdio/netbird'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream
+        env:
+          HAS_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+
+          if [ "$HAS_SYNC_TOKEN" != "true" ]; then
+            echo "::warning::FORK_SYNC_TOKEN is not set: the push will be refused whenever upstream changed a workflow file."
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "Already up to date with ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # [skip ci] keeps this push from starting push-triggered workflows,
+          # including an upstream one that is new in this merge and therefore
+          # not disabled yet.
+          if ! git merge --no-edit --no-ff \
+              -m "Merge ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} into ${TARGET_BRANCH} [skip ci]" \
+              FETCH_HEAD; then
+            {
+              echo "### Upstream merge needs a manual resolution"
+              echo
+              echo "Conflicting files:"
+              echo
+              git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/'
+              echo
+              echo "Resolve locally:"
+              echo
+              echo '```bash'
+              echo "git checkout ${TARGET_BRANCH} && git pull"
+              echo "git pull https://github.com/${UPSTREAM_REPO}.git ${UPSTREAM_BRANCH}"
+              echo "# fix the conflicts, then"
+              echo "git commit && git push"
+              echo '```'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            git merge --abort
+            exit 1
+          fi
+
+          git push origin "HEAD:${TARGET_BRANCH}"
+          echo "Merged $(git rev-parse --short FETCH_HEAD) from ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}." | tee -a "$GITHUB_STEP_SUMMARY"
+
+  disable-upstream-workflows:
+    name: "Disable upstream workflows"
+    needs: sync
+    # Runs after a failed merge too: disabling does not depend on it.
+    if: always() && github.repository != 'netbirdio/netbird'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Disable every workflow that is not fork-*.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Disabling is a repository setting keyed by workflow, not a file
+          # change, so it holds on every branch and never conflicts with an
+          # upstream merge. Dynamic entries (CodeQL, Dependabot) have no file
+          # under .github/workflows and are left alone.
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/workflows" \
+              --jq '.workflows[] | select(.state == "active") | [.id, .path] | @tsv' |
+          while IFS=$'\t' read -r id path; do
+            case "$path" in
+              .github/workflows/fork-*) continue ;;
+              .github/workflows/*) ;;
+              *) continue ;;
+            esac
+            echo "Disabling ${path}"
+            gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${id}/disable" ||
+              echo "::warning::could not disable ${path}"
+          done
