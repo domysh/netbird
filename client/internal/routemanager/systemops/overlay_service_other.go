@@ -2,15 +2,11 @@
 
 package systemops
 
-import "net"
+import (
+	"net"
+	"net/netip"
+)
 
-// announceV6Default is a no-op outside macOS, where resolvers do not gate AAAA
-// queries on a system-level IPv6 service.
-func (r *SysOps) announceV6Default(*net.Interface) error {
-	return nil
-}
-
-// withdrawV6Default is a no-op outside macOS.
-func (r *SysOps) withdrawV6Default() error {
-	return nil
-}
+// setOverlayDefault is a no-op outside macOS, where resolvers do not gate AAAA
+// queries on the primary network service.
+func (r *SysOps) setOverlayDefault(netip.Prefix, *net.Interface, bool) {}

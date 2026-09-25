@@ -5,8 +5,10 @@ package dns
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/netip"
 	"os/exec"
 	"slices"
@@ -19,6 +21,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/exp/maps"
 
+	"github.com/netbirdio/netbird/client/internal/routemanager/systemops"
 	"github.com/netbirdio/netbird/client/internal/statemanager"
 )
 
@@ -119,7 +122,20 @@ func (s *systemConfigurator) applyDNSConfig(config HostDNSConfig, stateManager *
 		log.Errorf("failed to flush DNS cache: %v", err)
 	}
 
+	// Promoted to primary network service, the overlay becomes the system's
+	// default resolver, which only works while NetBird serves host DNS.
+	if err := systemops.SetOverlayResolver(s, resolverAddrPort(config)); err != nil {
+		log.Warnf("failed to update the overlay resolver: %v", err)
+	}
+
 	return nil
+}
+
+func resolverAddrPort(config HostDNSConfig) netip.AddrPort {
+	if config.ServerPort <= 0 || config.ServerPort > math.MaxUint16 {
+		return netip.AddrPort{}
+	}
+	return netip.AddrPortFrom(config.ServerIP, uint16(config.ServerPort))
 }
 
 func (s *systemConfigurator) updateState(stateManager *statemanager.Manager) {
@@ -133,6 +149,10 @@ func (s *systemConfigurator) string() string {
 }
 
 func (s *systemConfigurator) restoreHostDNS() error {
+	if err := systemops.ClearOverlayResolver(s); err != nil {
+		log.Warnf("failed to withdraw the overlay resolver: %v", err)
+	}
+
 	keys := s.getRemovableKeysWithDefaults()
 	for _, key := range keys {
 		keyType := "search"
@@ -479,7 +499,29 @@ func (s *systemConfigurator) getPrimaryService() (string, string, error) {
 		return primaryService, router, fmt.Errorf("scan: %w", err)
 	}
 
+	physicalService, err := physicalPrimaryService(primaryService, systemops.OverlayPrimary())
+	if err != nil {
+		return "", "", err
+	}
+	if physicalService != primaryService {
+		log.Debugf("primary service is the NetBird overlay, reading the physical service %s instead", physicalService)
+		return physicalService, "", nil
+	}
 	return primaryService, router, nil
+}
+
+// physicalPrimaryService returns the physical service in place of the NetBird
+// overlay. The overlay is the primary service while an exit node carries IPv6
+// on an IPv4-only network, and its DNS is NetBird itself: taking it as the
+// original nameservers would make NetBird its own fallback upstream.
+func physicalPrimaryService(primary string, overlay systemops.OverlayPrimaryState) (string, error) {
+	if primary != systemops.OverlayServiceID {
+		return primary, nil
+	}
+	if overlay.PhysicalService == "" {
+		return "", errors.New("the NetBird overlay is the primary service and the physical service is unknown")
+	}
+	return overlay.PhysicalService, nil
 }
 
 func (s *systemConfigurator) flushDNSCache() error {

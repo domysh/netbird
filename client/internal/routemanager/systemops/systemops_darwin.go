@@ -46,6 +46,7 @@ func (r *SysOps) setupAdvancedRouting() error {
 	// binding, causing new sockets to scope to an interface without a matching
 	// scoped default.
 	nbnet.ClearBoundInterfaces()
+	r.clearPhysicalDefaults()
 
 	if err := r.flushScopedDefaults(); err != nil {
 		log.Warnf("flush residual scoped defaults: %v", err)
@@ -78,21 +79,9 @@ func (r *SysOps) setupAdvancedRouting() error {
 // address family, installs a scoped default via it, and caches the iface for
 // subsequent IP_BOUND_IF / IPV6_BOUND_IF socket binds.
 func (r *SysOps) installScopedDefaultFor(unspec netip.Addr) (bool, error) {
-	nexthop, err := GetNextHop(unspec)
-	if err != nil {
-		if errors.Is(err, vars.ErrRouteNotFound) {
-			return false, nil
-		}
-		return false, fmt.Errorf("get default nexthop for %s: %w", unspec, err)
-	}
-	if nexthop.Intf == nil {
-		return false, fmt.Errorf("unusable default nexthop for %s (no interface)", unspec)
-	}
-	// configd routes the default through the overlay while it is the primary
-	// v6 service; binding our own sockets there would loop them into the tunnel.
-	if r.wgInterface != nil && nexthop.Intf.Name == r.wgInterface.Name() {
-		log.Debugf("default nexthop for %s is the NetBird interface, skipping scoped default", afOf(unspec))
-		return false, nil
+	nexthop, ok, err := r.physicalDefaultNexthop(unspec)
+	if err != nil || !ok {
+		return false, err
 	}
 
 	reused := false
@@ -112,6 +101,7 @@ func (r *SysOps) installScopedDefaultFor(unspec netip.Addr) (bool, error) {
 		af = unix.AF_INET6
 	}
 	nbnet.SetBoundInterface(af, nexthop.Intf)
+	r.setPhysicalDefault(unspec, nexthop)
 	via := "point-to-point"
 	if nexthop.IP.IsValid() {
 		via = nexthop.IP.String()
@@ -124,20 +114,67 @@ func (r *SysOps) installScopedDefaultFor(unspec netip.Addr) (bool, error) {
 	return true, nil
 }
 
+// physicalDefaultNexthop resolves the physical default nexthop of unspec's
+// family. While the overlay is the primary network service the unscoped
+// default is the tunnel, and binding NetBird's own sockets there would loop
+// them into it, so the physical nexthop the promotion displaced is used.
+func (r *SysOps) physicalDefaultNexthop(unspec netip.Addr) (Nexthop, bool, error) {
+	nexthop, err := GetNextHop(unspec)
+	if err != nil {
+		if errors.Is(err, vars.ErrRouteNotFound) {
+			return Nexthop{}, false, nil
+		}
+		return Nexthop{}, false, fmt.Errorf("get default nexthop for %s: %w", unspec, err)
+	}
+	if nexthop.Intf == nil {
+		return Nexthop{}, false, fmt.Errorf("unusable default nexthop for %s (no interface)", unspec)
+	}
+	if r.wgInterface == nil || nexthop.Intf.Name != r.wgInterface.Name() {
+		return nexthop, true, nil
+	}
+
+	overlay := OverlayPrimary()
+	physical := overlay.Physical(unspec)
+	if !overlay.Active || physical.Intf == nil {
+		log.Debugf("default nexthop for %s is the NetBird interface, skipping scoped default", afOf(unspec))
+		return Nexthop{}, false, nil
+	}
+	log.Debugf("default nexthop for %s is the NetBird interface, using the physical nexthop %s", afOf(unspec), physical)
+	return physical, true, nil
+}
+
+func (r *SysOps) setPhysicalDefault(unspec netip.Addr, nexthop Nexthop) {
+	r.physicalDefaults.mu.Lock()
+	defer r.physicalDefaults.mu.Unlock()
+	if unspec.Is6() {
+		r.physicalDefaults.v6 = nexthop
+		return
+	}
+	r.physicalDefaults.v4 = nexthop
+}
+
+func (r *SysOps) clearPhysicalDefaults() {
+	r.physicalDefaults.mu.Lock()
+	defer r.physicalDefaults.mu.Unlock()
+	r.physicalDefaults.v4, r.physicalDefaults.v6 = Nexthop{}, Nexthop{}
+}
+
 func (r *SysOps) cleanupAdvancedRouting() error {
 	nbnet.ClearBoundInterfaces()
+	r.clearPhysicalDefaults()
 	return r.flushScopedDefaults()
 }
 
 // flushPlatformExtras runs darwin-specific residual cleanup hooked into the
-// generic FlushMarkedRoutes path, so a crashed daemon's scoped defaults get
-// removed on the next boot regardless of whether a profile is brought up.
+// generic FlushMarkedRoutes path, so a crashed daemon's scoped defaults and
+// overlay service get removed on the next boot regardless of whether a profile
+// is brought up.
 func (r *SysOps) flushPlatformExtras() error {
 	var merr *multierror.Error
 	if err := r.flushScopedDefaults(); err != nil {
 		merr = multierror.Append(merr, err)
 	}
-	if err := r.withdrawV6Default(); err != nil {
+	if err := removeOverlayService(); err != nil {
 		merr = multierror.Append(merr, err)
 	}
 	return nberrors.FormatErrorOrNil(merr)
