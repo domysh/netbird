@@ -32,6 +32,7 @@ import (
 	"github.com/netbirdio/netbird/client/internal/metrics"
 	"github.com/netbirdio/netbird/client/internal/peer"
 	"github.com/netbirdio/netbird/client/internal/profilemanager"
+	"github.com/netbirdio/netbird/client/internal/routemanager/systemops"
 	"github.com/netbirdio/netbird/client/internal/statemanager"
 	"github.com/netbirdio/netbird/client/internal/stdnet"
 	"github.com/netbirdio/netbird/client/internal/tunnelnotifier"
@@ -308,6 +309,8 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 			c.statusRecorder.CleanLocalPeerState()
 			cancel()
 		}()
+
+		systemops.BindSocketsToPhysicalDefault(c.config.WgIface)
 
 		log.Debugf("connecting to the Management service %s", c.config.ManagementURL.Host)
 		mgmClient, err := mgm.NewClient(engineCtx, c.config.ManagementURL.Host, myPrivateKey, mgmTlsEnabled,

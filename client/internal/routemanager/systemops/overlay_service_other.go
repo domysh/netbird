@@ -10,3 +10,7 @@ import (
 // setOverlayDefault is a no-op outside macOS, where resolvers do not gate AAAA
 // queries on the primary network service.
 func (r *SysOps) setOverlayDefault(netip.Prefix, *net.Interface, bool) {}
+
+// BindSocketsToPhysicalDefault is a no-op outside macOS, where the overlay
+// never takes the unscoped default away from NetBird's own sockets.
+func BindSocketsToPhysicalDefault(string) {}

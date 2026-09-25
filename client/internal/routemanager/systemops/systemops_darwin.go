@@ -5,6 +5,7 @@ package systemops
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"time"
@@ -31,15 +32,8 @@ const scopedRouteBudget = 5 * time.Second
 //
 // Timing note: this runs during routeManager.Init, which happens before the
 // VPN interface is created and before any peer routes propagate. The initial
-// mgmt / signal / relay TCP dials always fire before this runs, so those
-// sockets miss the IP_BOUND_IF binding and rely on the kernel's normal route
-// lookup, which at that point correctly picks the physical default. Those
-// already-established TCP flows keep their originally-selected interface for
-// their lifetime on Darwin because the kernel caches the egress route
-// per-socket at connect time; adding the VPN's 0/1 + 128/1 split default
-// afterwards does not migrate them since the original en0 default stays in
-// the table. Any subsequent reconnect via nbnet.NewDialer picks up the
-// populated bound-iface cache and gets IP_BOUND_IF set cleanly.
+// mgmt / signal / relay dials fire before this runs, and get IP_BOUND_IF from
+// the cache BindSocketsToPhysicalDefault filled ahead of them.
 func (r *SysOps) setupAdvancedRouting() error {
 	// Drop any previously-cached egress interface before reinstalling. On a
 	// refresh, a family that no longer resolves would otherwise keep the stale
@@ -96,11 +90,7 @@ func (r *SysOps) installScopedDefaultFor(unspec netip.Addr) (bool, error) {
 		reused = true
 	}
 
-	af := unix.AF_INET
-	if unspec.Is6() {
-		af = unix.AF_INET6
-	}
-	nbnet.SetBoundInterface(af, nexthop.Intf)
+	nbnet.SetBoundInterface(addrFamily(unspec), nexthop.Intf)
 	r.setPhysicalDefault(unspec, nexthop)
 	via := "point-to-point"
 	if nexthop.IP.IsValid() {
@@ -112,6 +102,45 @@ func (r *SysOps) installScopedDefaultFor(unspec netip.Addr) (bool, error) {
 	}
 	log.Infof("%s scoped default route via %s on %s for %s", verb, via, nexthop.Intf.Name, afOf(unspec))
 	return true, nil
+}
+
+// BindSocketsToPhysicalDefault binds NetBird's new sockets to the physical
+// default interface of each address family ahead of routing setup, so the
+// management, signal and relay connections dialed before it are bound too.
+// Unbound, they follow the unscoped default, which configd moves into the
+// tunnel once the overlay is the primary network service, cutting NetBird off
+// from its own control plane.
+func BindSocketsToPhysicalDefault(overlayIfName string) {
+	if !nbnet.AdvancedRouting() {
+		return
+	}
+
+	nbnet.ClearBoundInterfaces()
+	for _, unspec := range []netip.Addr{netip.IPv4Unspecified(), netip.IPv6Unspecified()} {
+		nexthop, err := GetNextHop(unspec)
+		intf := earlyBindTarget(nexthop, err, overlayIfName)
+		if intf == nil {
+			continue
+		}
+		nbnet.SetBoundInterface(addrFamily(unspec), intf)
+		log.Infof("binding NetBird sockets to %s for %s ahead of routing setup", intf.Name, afOf(unspec))
+	}
+}
+
+// earlyBindTarget returns the interface to bind NetBird's sockets to for a
+// default nexthop lookup, or nil when there is no usable physical default.
+func earlyBindTarget(nexthop Nexthop, err error, overlayIfName string) *net.Interface {
+	if err != nil || nexthop.Intf == nil || nexthop.Intf.Name == overlayIfName {
+		return nil
+	}
+	return nexthop.Intf
+}
+
+func addrFamily(unspec netip.Addr) int {
+	if unspec.Is6() {
+		return unix.AF_INET6
+	}
+	return unix.AF_INET
 }
 
 // physicalDefaultNexthop resolves the physical default nexthop of unspec's

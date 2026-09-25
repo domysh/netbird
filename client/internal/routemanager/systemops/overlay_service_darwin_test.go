@@ -510,3 +510,17 @@ func (f *fakeConfigd) show(out *strings.Builder, key string) {
 	}
 	out.WriteString("}\n")
 }
+
+func TestEarlyBindTarget(t *testing.T) {
+	en0 := &net.Interface{Index: 12, Name: "en0"}
+	utun := &net.Interface{Index: 23, Name: "utun100"}
+
+	assert.Equal(t, en0, earlyBindTarget(Nexthop{IP: netip.MustParseAddr("10.251.254.5"), Intf: en0}, nil, "utun100"),
+		"the physical default interface is bound")
+	assert.Nil(t, earlyBindTarget(Nexthop{Intf: utun}, nil, "utun100"),
+		"a default through the overlay itself would loop NetBird's sockets into the tunnel")
+	assert.Nil(t, earlyBindTarget(Nexthop{}, errors.New("route not found"), "utun100"),
+		"without a default there is nothing to bind to")
+	assert.Nil(t, earlyBindTarget(Nexthop{IP: netip.MustParseAddr("10.0.0.1")}, nil, "utun100"),
+		"a nexthop without an interface cannot be bound to")
+}
