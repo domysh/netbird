@@ -84,9 +84,10 @@ static BOOL gActivated = NO;
 // outlives the menu, and the lookup walks every window in the app.
 static NSStatusBarButton *gStatusButton = nil;
 
-// gWailsStatusClicked is Wails' own -[StatusItemController statusItemClicked:],
-// which the clicks it can dispatch are handed back to.
-static IMP gWailsStatusClicked = NULL;
+// gController is Wails' StatusItemController, retained once it first hands over
+// a menu, and gWailsSetCachedMenu is Wails' own setter for that menu.
+static id gController = nil;
+static IMP gWailsSetCachedMenu = NULL;
 
 // gStaging collects exit-node rows between begin and commit. Touched only by
 // the (serialised) Go caller until commit hands it to the main thread.
@@ -167,57 +168,54 @@ static NSStatusBarButton *nbStatusButton(void) {
     return nil;
 }
 
-// nbShowTrayMenu opens the tray menu of controller, Wails' StatusItemController,
-// the way Wails' own OpenMenu does: the menu is attached to the status item for
-// one native tracking session, with the controller as its delegate so that
-// closing it detaches it again. The controller's properties are only read once
-// it is known to have them, so a Wails that no longer does leaves the click
-// unanswered instead of crashing. Main thread.
-static void nbShowTrayMenu(id controller) {
-    if (gOpen ||
-        ![controller respondsToSelector:@selector(statusItem)] ||
-        ![controller respondsToSelector:@selector(cachedMenu)]) {
-        return;
-    }
-    NSStatusItem *item = [controller valueForKey:@"statusItem"];
-    NSMenu *menu = [controller valueForKey:@"cachedMenu"];
-    if (item == nil || menu == nil) {
-        return;
-    }
-    [menu setDelegate:controller];
-    [item setMenu:menu];
-    [[item button] performClick:nil];
+// nbAttachTrayMenu keeps the tray menu attached to the status item, so that the
+// system opens it on a click itself. From macOS 27 a left click on a menu bar
+// item reaches the app as the status item's action alone, without the
+// mouse-down Wails attaches the menu on, so the menu never opened; and a menu
+// opened from that action left the item selected after closing. Runs on the
+// next turn of the main run loop, after Wails' own close handling has detached
+// the menu again.
+static void nbAttachTrayMenu(id controller) {
+    CFRunLoopRef runLoop = CFRunLoopGetMain();
+    CFRunLoopPerformBlock(runLoop, (__bridge CFTypeRef)gModes, ^{
+        if (gController == nil && controller != nil &&
+            [controller respondsToSelector:@selector(statusItem)] &&
+            [controller respondsToSelector:@selector(cachedMenu)]) {
+            gController = [controller retain];
+        }
+        if (gOpen || gController == nil) {
+            return;
+        }
+        NSStatusItem *item = [gController valueForKey:@"statusItem"];
+        NSMenu *menu = [gController valueForKey:@"cachedMenu"];
+        if (item != nil && menu != nil && [item menu] != menu) {
+            [item setMenu:menu];
+        }
+    });
+    CFRunLoopWakeUp(runLoop);
 }
 
-// nbStatusItemClicked stands in for Wails' statusItemClicked:. Wails decides
-// what a click does from [NSApp currentEvent], but from macOS 27 a left click on
-// a menu bar item reaches the app as the status item's action alone, with no
-// mouse-down event behind it: Wails sees a stale event of another kind and
-// drops the click, so the menu never opened. A click backed by a mouse-down
-// goes to Wails unchanged. Main thread.
-static void nbStatusItemClicked(id self, SEL cmd, id sender) {
-    NSEventType type = [[NSApp currentEvent] type];
-    if (type == NSEventTypeLeftMouseDown || type == NSEventTypeRightMouseDown) {
-        ((void (*)(id, SEL, id))gWailsStatusClicked)(self, cmd, sender);
-        return;
-    }
-    nbShowTrayMenu(self);
+// nbSetCachedMenu stands in for Wails' setter of the tray menu, attaching every
+// menu Wails builds as it hands it over.
+static void nbSetCachedMenu(id self, SEL cmd, NSMenu *menu) {
+    ((void (*)(id, SEL, NSMenu *))gWailsSetCachedMenu)(self, cmd, menu);
+    nbAttachTrayMenu(self);
 }
 
-// nbTakeStatusClicks puts nbStatusItemClicked in place of Wails' handler. Wails
-// looks its controller up as the status item's target, so the controller has to
-// stay the target and only the method is replaced. Nothing happens when Wails
-// no longer has the method.
-static void nbTakeStatusClicks(void) {
-    if (gWailsStatusClicked != NULL) {
+// nbTakeTrayMenu puts nbSetCachedMenu in place of Wails' setter. Wails looks its
+// controller up as the status item's target, so the controller stays in place
+// and only the method is replaced. When Wails no longer has the setter nothing
+// happens, and the menu opens on a right click only.
+static void nbTakeTrayMenu(void) {
+    if (gWailsSetCachedMenu != NULL) {
         return;
     }
     Class controller = objc_getClass("StatusItemController");
-    Method clicked = (controller != Nil) ? class_getInstanceMethod(controller, @selector(statusItemClicked:)) : NULL;
-    if (clicked == NULL) {
+    Method setter = (controller != Nil) ? class_getInstanceMethod(controller, @selector(setCachedMenu:)) : NULL;
+    if (setter == NULL) {
         return;
     }
-    gWailsStatusClicked = method_setImplementation(clicked, (IMP)nbStatusItemClicked);
+    gWailsSetCachedMenu = method_setImplementation(setter, (IMP)nbSetCachedMenu);
 }
 
 // nbApplyState paints the remembered state onto the live switch. Main thread.
@@ -350,6 +348,7 @@ static void nbAdoptMenu(NSMenu *menu) {
         return;
     }
     gOpen = 0;
+    nbAttachTrayMenu(gController);
     if (gActivated) {
         gActivated = NO;
         [NSApp deactivate];
@@ -395,8 +394,8 @@ void nbmenu_start(const char *connection_marker) {
                        selector:@selector(menuEndedTracking:)
                            name:NSMenuDidEndTrackingNotification
                          object:nil];
-            nbTakeStatusClicks();
         });
+        nbTakeTrayMenu();
     });
 }
 
