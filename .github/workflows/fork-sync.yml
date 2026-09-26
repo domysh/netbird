@@ -8,6 +8,8 @@
 # - Only main is touched. Topic branches (the ones proposed upstream) are left
 #   exactly as they are.
 # - Upstream is merged, never rebased, so main is never force-pushed.
+# - Every merge that brings new upstream commits starts fork-dev-release.yml,
+#   so a fresh dev release follows each upstream update.
 #
 # Needs a FORK_SYNC_TOKEN secret: a fine-grained token for this repository with
 # "Contents" and "Workflows" read/write. GitHub refuses a push carrying
@@ -44,6 +46,9 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
+      sha: ${{ steps.merge.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -53,6 +58,7 @@ jobs:
           token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
 
       - name: Merge upstream
+        id: merge
         env:
           HAS_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN != '' }}
         run: |
@@ -100,6 +106,8 @@ jobs:
           fi
 
           git push origin "HEAD:${TARGET_BRANCH}"
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
           echo "Merged $(git rev-parse --short FETCH_HEAD) from ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}." | tee -a "$GITHUB_STEP_SUMMARY"
 
   disable-upstream-workflows:
@@ -133,3 +141,28 @@ jobs:
             gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${id}/disable" ||
               echo "::warning::could not disable ${path}"
           done
+
+  release:
+    name: "Start a dev release of the synced main"
+    needs: sync
+    if: needs.sync.outputs.merged == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      # A workflow_dispatch sent with GITHUB_TOKEN does start the target
+      # workflow, unlike a push or a tag made with it. The release job creates
+      # the tag on main's head, which is the merge pushed above.
+      - name: Dispatch the dev release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          TAG="dev-$(date -u +%Y.%m.%d)-${SHA}"
+          gh workflow run fork-dev-release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$TARGET_BRANCH" \
+            -f tag="$TAG" \
+            -f notes="Automatic build after merging ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}."
+          echo "Started dev release ${TAG}." | tee -a "$GITHUB_STEP_SUMMARY"
