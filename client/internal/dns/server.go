@@ -191,11 +191,14 @@ type DefaultServer struct {
 	// See refreshHealth for the lock-order rationale.
 	healthRefresh chan struct{}
 
-	// cacheFlushMu guards lastCacheFlush.
+	// cacheFlushMu guards lastCacheFlush and cacheFlushPending.
 	cacheFlushMu sync.Mutex
-	// lastCacheFlush is when the host DNS cache was last flushed by the
-	// health projection; used to coalesce bursts of recoveries.
+	// lastCacheFlush is the last successful host DNS cache flush, used to coalesce recoveries.
 	lastCacheFlush time.Time
+	// cacheFlushPending is set while a flush is scheduled but has not run yet.
+	cacheFlushPending bool
+	// cacheFlushCoalesce is the coalescing window, set at construction and mutated only by tests.
+	cacheFlushCoalesce time.Duration
 }
 
 type handlerWithStop interface {
@@ -313,6 +316,7 @@ func newDefaultServer(
 		warningDelayBase:  warningDelayBaseFromEnv(),
 		healthRefresh:     make(chan struct{}, 1),
 	}
+	defaultServer.cacheFlushCoalesce = hostCacheFlushCoalesce
 	// Wire the local resolver against the peer status recorder so it can
 	// suppress A/AAAA answers that point at disconnected peers (typical
 	// case: synthesised private-service records pointing at an embedded
@@ -1160,44 +1164,40 @@ func (s *DefaultServer) projectHealthy(p *nsGroupProj, servers []netip.AddrPort)
 	return true
 }
 
-// flushHostDNSCache asks the host manager to drop the OS-level DNS cache,
-// when the platform supports it (currently macOS). While the overlay
-// upstreams for a match domain are unreachable (e.g. right after wake from
-// sleep, before tunnels re-establish), queries can be answered by the
-// public resolvers and the OS caches those answers for their full TTL.
-// Flushing on the unhealthy->healthy transition makes clients pick up the
-// overlay answers again immediately instead of serving stale public ones.
-//
-// Flushes triggered within hostCacheFlushCoalesce of each other coalesce
-// into one, so several groups recovering on the same projection tick cause
-// a single flush.
+// flushHostDNSCache drops answers the OS cached while the group was down.
 func (s *DefaultServer) flushHostDNSCache() {
-	s.mux.Lock()
-	hm := s.hostManager
-	s.mux.Unlock()
+	s.cacheFlushMu.Lock()
+	defer s.cacheFlushMu.Unlock()
+	if s.cacheFlushPending {
+		return
+	}
+	s.cacheFlushPending = true
+	// Recoveries inside the window flush once it ends.
+	delay := time.Until(s.lastCacheFlush.Add(s.cacheFlushCoalesce))
+	time.AfterFunc(max(delay, 0), s.runHostDNSCacheFlush)
+}
 
-	// The assertion targets an unexported method on purpose: every
-	// hostManager implementation lives in this package (host_darwin.go
-	// implements flushDNSCache), so this matches on darwin and is a
-	// no-op everywhere else.
-	flusher, ok := hm.(interface{ flushDNSCache() error })
+// runHostDNSCacheFlush holds s.mux so it can't overlap DNS config changes sharing D-Bus.
+func (s *DefaultServer) runHostDNSCacheFlush() {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	s.cacheFlushMu.Lock()
+	s.cacheFlushPending = false
+	s.cacheFlushMu.Unlock()
+
+	flusher, ok := s.hostManager.(interface{ flushDNSCache() error })
 	if !ok {
+		return
+	}
+	if err := flusher.flushDNSCache(); err != nil {
+		log.Warnf("failed to flush host DNS cache after upstream recovery: %v", err)
 		return
 	}
 
 	s.cacheFlushMu.Lock()
-	if !s.lastCacheFlush.IsZero() && time.Since(s.lastCacheFlush) < hostCacheFlushCoalesce {
-		s.cacheFlushMu.Unlock()
-		return
-	}
 	s.lastCacheFlush = time.Now()
 	s.cacheFlushMu.Unlock()
-
-	go func() {
-		if err := flusher.flushDNSCache(); err != nil {
-			log.Warnf("failed to flush host DNS cache after upstream recovery: %v", err)
-		}
-	}()
 }
 
 // projectUnhealthy records an unhealthy tick on p, publishes the
