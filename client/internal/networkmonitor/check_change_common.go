@@ -104,6 +104,10 @@ func defaultRouteChanged(ev defaultRouteEvent, nexthopv4, nexthopv6 systemops.Ne
 		log.Infof("Network monitor: default route changed: %s", ev)
 		return true
 	case unix.RTM_DELETE:
+		if systemops.IgnoreDeletedDefaultRoute(ev.flags) {
+			log.Debugf("Network monitor: ignoring removed scoped default route %s", ev)
+			return false
+		}
 		if nexthopv4.Intf != nil && ev.gw.Compare(nexthopv4.IP) == 0 || nexthopv6.Intf != nil && ev.gw.Compare(nexthopv6.IP) == 0 {
 			log.Infof("Network monitor: default route removed: %s", ev)
 			return true
