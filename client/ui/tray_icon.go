@@ -73,7 +73,7 @@ func (t *Tray) iconForState() (icon, dark []byte) {
 	connecting := strings.EqualFold(statusLabel, services.StatusConnecting) ||
 		strings.EqualFold(statusLabel, statusDisconnecting)
 	errored := strings.EqualFold(statusLabel, statusError) ||
-		strings.EqualFold(statusLabel, services.StatusDaemonUnavailable)
+		services.IsDaemonOutage(statusLabel)
 	needsLogin := strings.EqualFold(statusLabel, services.StatusNeedsLogin) ||
 		strings.EqualFold(statusLabel, services.StatusSessionExpired) ||
 		strings.EqualFold(statusLabel, services.StatusLoginFailed)
